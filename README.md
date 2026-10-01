@@ -128,6 +128,7 @@ registry.py    build the publisher dimension from the GBIF API
 bench.py       measurement harness, reads the driver UI REST API
 job.py         the pipeline: nine stages and a Config of every tunable setting
 day9.py        command line interface over job.py, plus the run log
+run_ingest.sh  loop curate.py build in fixed-size chunks, with one retry
 
 day1.py        environment and first read
 day2.py        profiling the snapshot
