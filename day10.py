@@ -39,7 +39,7 @@ exists.
 
 A NOTE ON THE FIRST THING THIS DAY FOUND. The job could not be profiled as
 shipped. Day 9's default persists the enriched table in MEMORY_AND_DISK, and on
-anything above the 20 MB toy batch that dies:
+anything above the 19 MB toy batch that dies:
 
     Caused by: java.lang.OutOfMemoryError: Java heap space
       at ... apply_cache -> df.count()

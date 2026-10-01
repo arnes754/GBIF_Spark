@@ -136,7 +136,7 @@ rather than something remembered from a browser tab that no longer exists.
 ### What it found
 
 **First: the job could not be profiled as shipped.** Day 9's default persists
-the enriched table in `MEMORY_AND_DISK`, and on anything above the 20 MB toy
+the enriched table in `MEMORY_AND_DISK`, and on anything above the 19 MB toy
 batch that OOMs the driver. The profile runs with `--cache none`; day 4 of this
 week is where that gets dealt with properly.
 
@@ -461,7 +461,7 @@ Caused by: java.lang.RuntimeException: java.lang.OutOfMemoryError: Java heap spa
   at ... job.py apply_cache -> df.count()
 ```
 
-on `b0004` (5.7 GB). Then on `b0000` (1.04 GB). Only the 20 MB toy batch ever
+on `b0004` (5.7 GB). Then on `b0000` (1.04 GB). Only the 19 MB toy batch ever
 completed — which is the only size day 9 had ever been run at.
 
 I had assumed `MEMORY_AND_DISK` could not OOM by definition; that is what the
@@ -655,7 +655,7 @@ tuning advice is about shuffling.
 ## What I would do differently
 
 - **Run the job at more than one size before declaring it finished.** Day 9
-  only ever ran on the 20 MB batch, which is exactly the size at which the
+  only ever ran on the 19 MB batch, which is exactly the size at which the
   wrong caching decision looks right. One run on a 1 GB slice would have caught
   it a week earlier.
 - **Compute bytes-read ÷ input-size as a reflex.** It is one division and it
