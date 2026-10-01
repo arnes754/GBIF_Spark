@@ -15,5 +15,5 @@ wheels/
 # materialised parquet + ingest manifests (rebuild with curate.py)
 data/
 
-# raw run logs (noisy, regenerated); the written-up logs are kept
-logs/*.log
+# run logs
+logs/

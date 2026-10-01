@@ -92,11 +92,10 @@ with measure(spark, "wide: orderBy(gbifid)") as m:
 runs.append(m)
 show(runs)
 print("""
-  `shuffle w` is the number to watch. The narrow line writes zero. Everything
-  else pays: serialise, write to local disk, fetch over the network, merge.
-  orderBy is the most expensive of the three because a global sort needs a
-  range-partitioning pass over a SAMPLE of the data before it can even start -
-  that is why it has an extra stage.""")
+  `shuffle w` is the number to watch: the narrow line writes zero, the rest
+  pay to serialise, write to local disk, fetch and merge. orderBy costs most
+  because a global sort first range-partitions over a sample of the data,
+  which is the extra stage.""")
 
 # ---------------------------------------------------------------------------
 banner("3. partial aggregation: why groupBy is cheaper than it looks")
@@ -297,22 +296,19 @@ best = min(runs, key=lambda r: r["seconds"])
 print(f"""
   Fastest here: {best['label']} at {best['seconds']:.1f}s.
 
-  Too few partitions means too little parallelism - at 4, most of the machine
-  is idle. Too many means scheduling overhead and thousands of tiny shuffle
-  files; note how `shuffle w` GROWS with the partition count for identical
-  output, because each partition carries its own framing.
+  Too few partitions leaves the machine idle; too many costs scheduling
+  overhead and tiny shuffle files. `shuffle w` grows with the partition
+  count for identical output, because each partition carries its own
+  framing.
 
-  What is NOT visible here is spill: every row reads 0 B. This aggregate
-  produces ~250x44 groups, so even 4 partitions fit comfortably in memory.
-  Spill is a function of partition SIZE against executor memory, and at 2.3 GB
-  with a 6 GB driver there is simply no pressure. Section 3's groupBy(gbifid)
-  spilled 3.8 GB - that is what pressure looks like, and it came from
-  cardinality, not from this setting.
+  No spill here: this aggregate produces ~250x44 groups, so even 4
+  partitions fit in memory. Spill comes from partition size against
+  executor memory, which is why section 3's groupBy(gbifid) spilled 3.8 GB
+  and this does not.
 
-  AQE reads map-side statistics and coalesces post-shuffle partitions
-  itself, so an over-large setting mostly stops mattering. It only coalesces
-  downward though: it cannot create more partitions than requested, so a
-  too-low setting stays too low.""")
+  AQE coalesces post-shuffle partitions using map-side statistics, so an
+  over-large setting mostly stops mattering. It only coalesces downward
+  though, so a too-low setting stays too low.""")
 
 # ---------------------------------------------------------------------------
 banner("8. caching: when it pays and when it is a tax")
