@@ -64,11 +64,11 @@ class Config:
     # stage to force the timing, once again in the write stage. With this on,
     # each aggregate stage writes its own results, so the write IS the forcing
     # and each aggregate is computed exactly once.
-    write_in_place: bool = False
+    write_in_place: bool = True
     # Persist the per-dataset aggregate (~1.4k rows) because stages 5, 6 and 8
     # all read it. The opposite trade to caching the fact table: small, and
     # expensive to produce rather than cheap.
-    cache_results: bool = False
+    cache_results: bool = True
     join: str = "auto"                  # see JOIN_MODES
     aqe: bool = True
     aqe_skew_join: bool = True

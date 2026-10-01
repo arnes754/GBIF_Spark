@@ -8,8 +8,9 @@ The rule from SCOPE.md section 4: full data in, small aggregates out. The
 inputs are gigabytes, the outputs are kilobytes, and nothing downstream ever
 reads the fact table again.
 
-    uv run python day9.py --batches b0000,b0003 --tag baseline
-    uv run python day9.py --shuffle-partitions 200 --tag tuned
+    uv run python day9.py --batches b0004 --tag run
+    uv run python day9.py --batches b0004 --cache memory_and_disk \
+        --no-write-in-place --no-cache-results --tag as-day-9-shipped
     uv run python day9.py --report          # compare past runs
 
 Every run appends a row to data/reports/runs.jsonl with per-stage wall time,
@@ -62,12 +63,15 @@ def main():
     p.add_argument("--no-aqe", action="store_true", help="turn AQE off (day 12)")
     p.add_argument("--no-skew-join", action="store_true",
                    help="turn AQE's skew-join split off (day 12)")
-    p.add_argument("--write-in-place", action="store_true",
-                   help="each aggregate stage writes its own results, so no "
-                        "aggregate is computed twice (day 10/14)")
-    p.add_argument("--cache-results", action="store_true",
-                   help="persist the small per-dataset aggregate, which three "
-                        "stages read (day 13)")
+    # Both of these are ON by default - they are week 3's conclusions. The
+    # flags turn them OFF, so day14.py can reconstruct day 9's behaviour
+    # exactly without anyone having to remember what it used to be.
+    p.add_argument("--no-write-in-place", action="store_true",
+                   help="go back to one write stage at the end, which computes "
+                        "every aggregate a second time (day 10)")
+    p.add_argument("--no-cache-results", action="store_true",
+                   help="do not persist the small per-dataset aggregate that "
+                        "three stages read (day 13)")
     p.add_argument("--no-coalesce-output", action="store_true",
                    help="write result tables without coalesce(1) (day 11)")
     p.add_argument("--driver-memory", default="4g")
@@ -88,8 +92,8 @@ def main():
         join=args.join,
         aqe=not args.no_aqe,
         aqe_skew_join=not args.no_skew_join,
-        write_in_place=args.write_in_place,
-        cache_results=args.cache_results,
+        write_in_place=not args.no_write_in_place,
+        cache_results=not args.no_cache_results,
         coalesce_output=not args.no_coalesce_output,
         driver_memory=args.driver_memory,
         tag=args.tag,

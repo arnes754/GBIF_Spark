@@ -132,14 +132,57 @@ Two things that number cannot tell you, both documented in `logs/gotchas.md`:
 | `day9.py` | **the end-to-end run** - nine stages, each timed, bytes and shuffle attributed; results written small; read back and verified; every run appended to `data/reports/runs.jsonl` |
 
 ```bash
-uv run python day9.py --tag baseline
-uv run python day9.py --shuffle-partitions 200 --tag tuned
+uv run python day9.py --batches b0000 --tag baseline
+uv run python day9.py --batches b0000 --cache none --write-in-place --tag tuned
 uv run python day9.py --report          # compare runs, stage breakdown
 ```
 
 Rule, from SCOPE.md section 4: **full data in, small aggregates out.** The
 inputs are gigabytes, the outputs are kilobytes, and nothing downstream reads
 the fact table again.
+
+## Week 3 - optimising it
+
+Full write-up with every measurement: **[WEEK3.md](WEEK3.md)**.
+
+The job itself moved out of `day9.py` into `job.py` - nine stage functions and
+a `Config` of everything a run is allowed to differ by. No stage reads a
+global, so two runs differ by exactly the fields that differ in their Config,
+which is what lets day 14 print the difference as a table. `day9.py` is now the
+CLI and the run log.
+
+| | |
+|---|---|
+| `day10.py` | **reading the Spark UI** - which tab answers which question; stages ranked by wall time; every Exchange with its bytes; per-task min/median/max so skew is distinguishable from slowness. `--hold` keeps the UI up |
+| `day11.py` | **partitioning** - input / shuffle / output partitions kept apart; `maxPartitionBytes` and the open-cost charge; which filters reach the directory listing; 12/48/200/800 shuffle partitions with AQE on and off; repartition vs coalesce vs neither, with the read-back cost |
+| `day12.py` | **broadcast joins and skew** - whether Spark broadcasts the dimension unprompted and how it decides; broadcast vs forced sort-merge; how skewed `datasetkey` really is; AQE skew join on and off; hand-salting measured against it |
+| `day13.py` | **caching** - how many times the job really reads the enriched table; the three storage levels end to end; the break-even arithmetic; and the slice where the cache does not fit |
+| `day14.py` | **before and after** - three configurations x three slices, each a fresh JVM, with the failures kept in the table |
+
+```bash
+uv run python day10.py --batches b0000 --hold
+uv run python day14.py --slices b0003,b0000,b0004 --warm
+uv run python day14.py --report
+```
+
+**What changed, and what did not.** Two changes, both from measurements:
+
+- **the cache came out.** Day 9 persisted the enriched fact table because seven
+  stages read it. That is the right question and the wrong answer - the thing
+  being cached is a parquet scan plus a broadcast join, cheap to recompute and
+  expensive to store, and it OOM'd the driver on every slice above 20 MB. The
+  small, expensive intermediate (`by_dataset`, ~1,400 rows, read by three
+  stages) is persisted instead.
+- **aggregates are computed once, not twice.** Every result DataFrame was
+  forced with `count()` to time it and then recomputed by the write stage: 22
+  passes over the fact table for 11 outputs. Each stage now writes what it
+  built.
+
+Three days ended in *no change*, each with the measurement that says why:
+shuffle partitions (the shuffles are kilobytes and AQE coalesces them anyway),
+input partitioning (the files are already near `maxPartitionBytes`), and
+broadcast/skew (the join is already a broadcast, so there is no shuffle and
+therefore no skew). Those are in `logs/decisions.md` with the rejected option.
 
 ## Log
 
