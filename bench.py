@@ -34,7 +34,13 @@ import re
 import time
 import urllib.request
 
-UI = "http://localhost:4040/api/v1"
+# The UI port is NOT always 4040. Spark takes the next free port if 4040 is
+# taken, so a second session on the same machine lands on 4041 - and a
+# hardcoded 4040 then queries the WRONG application. It does not error: the
+# app id is not found there, every request 404s, and every metric comes back
+# zero. A table full of honest-looking zeroes. Ask the context where its own
+# UI is instead.
+UI_FALLBACK = "http://localhost:4040"
 
 # operator metric name -> our field. Several operators can emit the same metric
 # name in one execution (two Exchanges, three Scans), so everything sums.
@@ -77,8 +83,13 @@ def parse_metric(value):
     return n * _UNITS.get(unit, 1)
 
 
-def _ui(path):
-    with urllib.request.urlopen(f"{UI}{path}", timeout=60) as r:
+def ui_base(spark):
+    """This session's own UI root, straight from the context."""
+    return (spark.sparkContext.uiWebUrl or UI_FALLBACK).rstrip("/")
+
+
+def _ui(spark, path):
+    with urllib.request.urlopen(f"{ui_base(spark)}/api/v1{path}", timeout=60) as r:
         return json.loads(r.read())
 
 
@@ -93,7 +104,7 @@ def _sql(spark, after=-1):
     `offset` is an index into the list, not an execution id, so it is NOT a
     safe way to say "everything after id N" - filtering on the id is."""
     try:
-        execs = _ui(f"/applications/{_app(spark)}/sql"
+        execs = _ui(spark, f"/applications/{_app(spark)}/sql"
                     f"?offset=0&length=100000&planDescription=false")
     except Exception:
         return []
@@ -104,8 +115,39 @@ def _stages(spark, after=-1):
     """Stage metrics, used ONLY for task counts and executor time - the two
     things /stages reports honestly."""
     try:
-        return [s for s in _ui(f"/applications/{_app(spark)}/stages?status=COMPLETE")
+        return [s for s in _ui(spark, f"/applications/{_app(spark)}/stages?status=COMPLETE")
                 if s["stageId"] > after]
+    except Exception:
+        return []
+
+
+# --- public UI accessors (day 10 reads the UI as data) -----------------------
+def ui_json(spark, path):
+    """Any UI endpoint for THIS application, as parsed JSON.
+
+    The browser at :4040 and this function read the same store. Day 10's point
+    is that every number on those pages is a REST call away, so "what did the
+    UI say" can be a committed table instead of a screenshot.
+    """
+    return _ui(spark, f"/applications/{_app(spark)}{path}")
+
+
+def stage_list(spark, summaries=False):
+    """Completed stages. With summaries=True each stage carries
+    `taskMetricsDistributions` - the per-task quantiles, which is the only
+    place skew within a stage is visible as a number."""
+    q = "?status=COMPLETE" + ("&withSummaries=true&quantiles=0,0.25,0.5,0.75,1.0"
+                              if summaries else "")
+    try:
+        return ui_json(spark, f"/stages{q}")
+    except Exception:
+        return []
+
+
+def sql_list(spark):
+    """SQL executions with their operator trees and metrics."""
+    try:
+        return ui_json(spark, "/sql?offset=0&length=100000&planDescription=false")
     except Exception:
         return []
 
@@ -173,6 +215,10 @@ def measure(spark, label):
     """
     sql_hw, stage_hw = _high_water(spark)
     m = Measurement(label=label, seconds=0.0, **{f: 0 for f in FIELDS})
+    # Which executions and stages this block owns. Day 10 needs it: a stage
+    # timing says WHERE the time went, and the only way back to WHY is the
+    # operator tree and the task distribution behind that exact id.
+    m["exec_ids"], m["stage_ids"] = [], []
     t0 = time.perf_counter()
     try:
         yield m
@@ -186,6 +232,7 @@ def measure(spark, label):
         _settle(spark, sql_hw)
         for q in _sql(spark, sql_hw):
             m["executions"] += 1
+            m["exec_ids"].append(q["id"])
             for node in q.get("nodes", []):
                 is_scan = "Scan" in node.get("nodeName", "")
                 for met in node.get("metrics", []):
@@ -199,6 +246,7 @@ def measure(spark, label):
                         m[field] += parse_metric(met["value"])
         for s in _stages(spark, stage_hw):
             m["stages"] += 1
+            m["stage_ids"].append(s["stageId"])
             m["tasks"] += s.get("numCompleteTasks", 0)
             m["task_ms"] += s.get("executorRunTime", 0)
 

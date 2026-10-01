@@ -8,14 +8,17 @@ The rule from SCOPE.md section 4: full data in, small aggregates out. The
 inputs are gigabytes, the outputs are kilobytes, and nothing downstream ever
 reads the fact table again.
 
-    uv run python day9.py
-    uv run python day9.py --out data/results --tag baseline
+    uv run python day9.py --batches b0000,b0003 --tag baseline
     uv run python day9.py --shuffle-partitions 200 --tag tuned
     uv run python day9.py --report          # compare past runs
 
 Every run appends a row to data/reports/runs.jsonl with per-stage wall time,
 bytes read and bytes shuffled, so "did that change help" is a lookup rather
 than a memory.
+
+WEEK 3 NOTE: the nine stages moved into `job.py` so days 10-14 can run them
+with one knob moved. This file is now the CLI and the run log; the pipeline
+itself is `job.run()`. Nothing about what it computes changed.
 """
 import argparse
 import datetime
@@ -24,321 +27,157 @@ import pathlib
 import platform
 import time
 
-from pyspark.sql import Window, functions as F
-
-import bench
-import gbif
-from bench import banner, gb, measure
+import job
+from bench import banner, gb
 
 HERE = pathlib.Path(__file__).parent
 REPORTS = HERE / "data" / "reports"
+RUNS = REPORTS / "runs.jsonl"
 
 
-class Stages:
-    """One list of measurements, printed as the report at the end.
-
-    Stage boundaries are chosen to match the questions someone would ask about
-    the job - "is it read-bound or shuffle-bound", "how much of it is the
-    join" - not to match the code's function boundaries.
-    """
-    def __init__(self, spark):
-        self.spark, self.rows = spark, []
-
-    def run(self, label, fn):
-        print(f"\n--- {label} " + "-" * (60 - len(label)))
-        with measure(self.spark, label) as m:
-            out = fn()
-        self.rows.append(m)
-        print(f"    {m}")
-        return out
-
-    def report(self, wall):
-        """The deliverable of day 9: where the time went, as a table."""
-        for m in self.rows:
-            m["pct"] = 100 * m["seconds"] / max(wall, 1e-9)
-        banner("stage timings")
-        bench.show(self.rows, [
-            ("stage", "label", bench.TXT),
-            ("secs", "seconds", bench.SEC),
-            ("%", "pct", bench.PCT),
-            ("read", "input_bytes", bench.BYTES),
-            ("files", "files_read", bench.NUM),
-            ("rows scanned", "scan_rows", bench.NUM),
-            ("shuffle w", "shuffle_write_bytes", bench.BYTES),
-            ("spill", "disk_spill_bytes", bench.BYTES),
-            ("tasks", "tasks", bench.NUM),
-        ])
-        print()
-        for m in self.rows:
-            bar = "#" * int(round(46 * m["seconds"] / max(wall, 1e-9)))
-            print(f"  {m['label']:<30}{m['seconds']:>8.1f}s {m['pct']:>5.0f}%  {bar}")
-        return self.rows
+def parse_batches(s):
+    """--batches b0000,b0003 -> ("b0000", "b0003"); empty means the whole table."""
+    return tuple(b.strip() for b in s.split(",") if b.strip()) if s else ()
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--table", default="data/curated/occurrence_slim")
-    p.add_argument("--dim", default="data/curated/dataset_dim")
-    p.add_argument("--out", default="data/results")
+    p.add_argument("--table", default=job.DEFAULT_TABLE)
+    p.add_argument("--dim", default=job.DEFAULT_DIM)
+    p.add_argument("--out", default=str(HERE / "data" / "results"))
+    p.add_argument("--batches", default="",
+                   help="comma-separated ingest batches, e.g. b0000,b0003. "
+                        "Empty = the whole 90 GB table.")
     p.add_argument("--tag", default="default", help="label this run in runs.jsonl")
     p.add_argument("--shuffle-partitions", type=int, default=48)
+    p.add_argument("--max-partition-bytes", type=int,
+                   default=job.DEFAULT_MAX_PARTITION_BYTES,
+                   help="spark.sql.files.maxPartitionBytes (day 11)")
+    p.add_argument("--cache", default="memory_and_disk", choices=job.CACHE_MODES,
+                   help="how to persist the enriched table (day 13)")
+    p.add_argument("--join", default="auto", choices=job.JOIN_MODES,
+                   help="let Spark choose, force broadcast, or forbid it (day 12)")
+    p.add_argument("--no-aqe", action="store_true", help="turn AQE off (day 12)")
+    p.add_argument("--no-skew-join", action="store_true",
+                   help="turn AQE's skew-join split off (day 12)")
+    p.add_argument("--write-in-place", action="store_true",
+                   help="each aggregate stage writes its own results, so no "
+                        "aggregate is computed twice (day 10/14)")
+    p.add_argument("--cache-results", action="store_true",
+                   help="persist the small per-dataset aggregate, which three "
+                        "stages read (day 13)")
+    p.add_argument("--no-coalesce-output", action="store_true",
+                   help="write result tables without coalesce(1) (day 11)")
     p.add_argument("--driver-memory", default="4g")
     p.add_argument("--no-cache", action="store_true",
-                   help="do not cache the enriched table - every stage re-reads")
+                   help="shorthand for --cache none")
     p.add_argument("--report", action="store_true", help="print past runs and exit")
     args = p.parse_args()
 
     if args.report:
         return print_report()
 
-    out = pathlib.Path(args.out)
+    cfg = job.Config(
+        table=args.table, dim=args.dim, out=args.out,
+        batches=parse_batches(args.batches),
+        shuffle_partitions=args.shuffle_partitions,
+        max_partition_bytes=args.max_partition_bytes,
+        cache="none" if args.no_cache else args.cache,
+        join=args.join,
+        aqe=not args.no_aqe,
+        aqe_skew_join=not args.no_skew_join,
+        write_in_place=args.write_in_place,
+        cache_results=args.cache_results,
+        coalesce_output=not args.no_coalesce_output,
+        driver_memory=args.driver_memory,
+        tag=args.tag,
+    )
+
     t_total = time.perf_counter()
     started = datetime.datetime.now()
+    in_bytes = cfg.input_bytes_on_disk()
 
-    banner(f"end-to-end run  [{args.tag}]  {started:%Y-%m-%d %H:%M}")
-    print(f"table               : {args.table}")
-    print(f"dimension           : {args.dim}")
-    print(f"out                 : {out}")
-    print(f"shuffle.partitions  : {args.shuffle_partitions}")
-    print(f"driver memory       : {args.driver_memory}")
-    print(f"cache enriched      : {not args.no_cache}")
-    print(f"host                : {platform.machine()} / "
-          f"{__import__('os').cpu_count()} cores")
+    banner(f"end-to-end run  [{cfg.tag}]  {started:%Y-%m-%d %H:%M}")
+    print(f"  config    : {cfg.describe()}")
+    print(f"  input     : {gb(in_bytes)} on disk")
+    print(f"  out       : {cfg.out}")
+    print(f"  host      : {platform.machine()} / "
+          f"{__import__('os').cpu_count()} cores, driver {cfg.driver_memory}")
 
-    spark = gbif.spark_session(app=f"gbif-e2e-{args.tag}",
-                               driver_memory=args.driver_memory,
-                               shuffle_partitions=args.shuffle_partitions)
-    spark.sparkContext.setLogLevel("ERROR")
-    st = Stages(spark)
+    spark = job.session_for(cfg, app=f"gbif-e2e-{cfg.tag}")
+    st, _results, summary = job.run(spark, cfg)
 
-    # -- 1. read ------------------------------------------------------------
-    state = {}
-
-    def stage_read():
-        facts = spark.read.option("mergeSchema", "true").parquet(args.table)
-        dim = spark.read.parquet(args.dim)
-        state["facts"], state["dim"] = facts, dim
-        state["n_facts"] = facts.count()
-        state["n_dim"] = dim.count()
-        print(f"    facts {state['n_facts']:,} rows x {len(facts.columns)} cols"
-              f"   dim {state['n_dim']:,} rows")
-        return facts
-
-    st.run("1 read + schema resolve", stage_read)
-
-    # -- 2. enrich ----------------------------------------------------------
-    def stage_enrich():
-        dim = state["dim"].select("datasetkey", "publisher_key", "publisher_title",
-                                  "publisher_country", "license")
-        e = (state["facts"]
-             .join(F.broadcast(dim), "datasetkey", "left")
-             .withColumn("publisher_key",
-                         F.coalesce("publisher_key", F.lit("UNREGISTERED")))
-             .withColumn("publisher_title",
-                         F.coalesce("publisher_title", F.lit("<not in registry>")))
-             .select("gbifid", "datasetkey", "publisher_key", "publisher_title",
-                     "publisher_country", "country", "decade", "year", "basis",
-                     "species", "specieskey", "cell_id", "n_issues",
-                     "n_geo_issues", "issues", "usable_for_mapping",
-                     "uncertainty_known", "interpreted_year"))
-        if not args.no_cache:
-            e = e.cache()
-            e.count()
-        state["e"] = e
-        plan = e._jdf.queryExecution().executedPlan().toString()
-        print(f"    join strategy: "
-              f"{'BroadcastHashJoin' if 'BroadcastHashJoin' in plan else 'SortMergeJoin'}")
-        return e
-
-    st.run("2 enrich (broadcast join)", stage_enrich)
-    e = state["e"]
-
-    # -- 3-7. the aggregates ------------------------------------------------
-    results = {}
-
-    def headline():
-        r = e.agg(
-            F.count("*").alias("records"),
-            F.avg(F.col("usable_for_mapping").cast("int")).alias("usable"),
-            F.avg((F.col("usable_for_mapping") & F.col("uncertainty_known")).cast("int")).alias("usable_strict"),
-            F.avg("n_issues").alias("mean_flags"),
-            F.avg((F.col("n_issues") > 0).cast("int")).alias("any_flag"),
-            F.avg((F.col("n_geo_issues") > 0).cast("int")).alias("geo_flag"),
-            F.approx_count_distinct("specieskey", 0.02).alias("species"),
-            F.approx_count_distinct("cell_id", 0.02).alias("cells"),
-            F.approx_count_distinct("publisher_key", 0.02).alias("publishers"),
-        )
-        results["headline"] = r
-        return r.collect()[0]
-
-    head = st.run("3 headline aggregate", headline)
-
-    def breakdowns():
-        usable = F.avg(F.col("usable_for_mapping").cast("int")).alias("usable")
-        n = F.count("*").alias("records")
-        flags = F.avg("n_issues").alias("mean_flags")
-        for name, keys in [("by_decade", ["decade"]),
-                           ("by_country", ["country"]),
-                           ("by_basis", ["basis"]),
-                           ("by_publisher_country", ["publisher_country"]),
-                           ("by_decade_country", ["decade", "country"])]:
-            results[name] = e.groupBy(*keys).agg(n, usable, flags)
-        # force them so the stage timing is honest - a lazy DataFrame costs 0
-        return [d.count() for d in
-                [results[k] for k in ("by_decade", "by_country", "by_basis",
-                                      "by_publisher_country", "by_decade_country")]]
-
-    st.run("4 breakdowns (5 groupBys)", breakdowns)
-
-    def publisher_stats():
-        per_dataset = (e.groupBy("publisher_key", "publisher_title", "datasetkey")
-                        .agg(F.count("*").alias("records"),
-                             F.avg("n_issues").alias("mean_flags"),
-                             F.avg(F.col("usable_for_mapping").cast("int")).alias("usable"))
-                        .where(F.col("records") >= 1000))
-        w = Window.partitionBy("publisher_key")
-        ranked = (per_dataset
-                  .withColumn("pub_records", F.sum("records").over(w))
-                  .withColumn("pub_mean_flags", F.avg("mean_flags").over(w))
-                  .withColumn("pub_datasets", F.count("*").over(w))
-                  .withColumn("rank_in_pub",
-                              F.row_number().over(w.orderBy(F.desc("records"))))
-                  .withColumn("flag_gap", F.col("mean_flags") - F.col("pub_mean_flags")))
-        results["by_dataset"] = ranked
-        results["by_publisher"] = (e.groupBy("publisher_key", "publisher_title",
-                                             "publisher_country")
-                                    .agg(F.count("*").alias("records"),
-                                         F.avg(F.col("usable_for_mapping").cast("int")).alias("usable"),
-                                         F.avg("n_issues").alias("mean_flags"),
-                                         F.approx_count_distinct("datasetkey", 0.02).alias("datasets")))
-        return ranked.count()
-
-    n_ds = st.run("5 publisher/dataset windows", publisher_stats)
-
-    def variance():
-        w = Window.partitionBy("publisher_key")
-        s = (results["by_dataset"].select("publisher_key", "mean_flags")
-             .withColumn("pub_mean", F.avg("mean_flags").over(w))
-             .withColumn("pub_n", F.count("*").over(w))
-             .where(F.col("pub_n") >= 3))
-        grand = s.agg(F.avg("mean_flags")).collect()[0][0] or 0.0
-        v = s.agg(F.avg(F.pow(F.col("mean_flags") - F.col("pub_mean"), 2)).alias("within"),
-                  F.avg(F.pow(F.col("pub_mean") - F.lit(grand), 2)).alias("between"),
-                  F.count("*").alias("datasets")).collect()[0]
-        row = {"grand_mean": grand, "within": v["within"] or 0.0,
-               "between": v["between"] or 0.0, "datasets": v["datasets"]}
-        row["between_share"] = row["between"] / max(row["within"] + row["between"], 1e-12)
-        results["variance"] = spark.createDataFrame([row])
-        return row
-
-    var = st.run("6 variance decomposition", variance)
-
-    def flag_stats():
-        f = e.select("publisher_key", "decade", "country",
-                     F.explode("issues").alias("flag"))
-        results["by_flag"] = f.groupBy("flag").count()
-        results["by_flag_publisher"] = f.groupBy("publisher_key", "flag").count()
-        results["by_flag_decade"] = f.groupBy("decade", "flag").count()
-        return results["by_flag"].count()
-
-    n_flags = st.run("7 explode + flag aggregates", flag_stats)
-
-    # -- 8. write -----------------------------------------------------------
-    def write():
-        out.mkdir(parents=True, exist_ok=True)
-        sizes = {}
-        for name, d in results.items():
-            path = out / name
-            d.coalesce(1).write.mode("overwrite").option("compression", "zstd") \
-             .parquet(str(path))
-            sizes[name] = sum(f.stat().st_size for f in path.rglob("*.parquet"))
-        state["sizes"] = sizes
-        print(f"    {len(sizes)} result tables, {gb(sum(sizes.values()))} total")
-        return sizes
-
-    sizes = st.run("8 write aggregates", write)
-
-    # -- 9. read back -------------------------------------------------------
-    def verify():
-        back = spark.read.parquet(str(out / "by_decade"))
-        total = back.agg(F.sum("records")).collect()[0][0]
-        ok = total == state["n_facts"]
-        print(f"    sum(by_decade.records) = {total:,}  "
-              f"vs facts {state['n_facts']:,}  -> {'OK' if ok else 'MISMATCH'}")
-        state["verified"] = bool(ok)
-        return ok
-
-    st.run("9 read back + verify", verify)
-
-    # -- report -------------------------------------------------------------
     wall = time.perf_counter() - t_total
     rows = st.report(wall)
+    tot = job.totals(rows)
     print(f"\n  total wall time            {wall:.1f}s")
-    print(f"  sum of stages              {sum(m['seconds'] for m in rows):.1f}s"
+    print(f"  sum of stages              {tot['seconds']:.1f}s"
           f"   (the gap is session startup and plan construction)")
-    print(f"  total bytes read           {gb(sum(m['input_bytes'] for m in rows))}")
-    print(f"  total bytes shuffled       {gb(sum(m['shuffle_write_bytes'] for m in rows))}")
-    print(f"  total executor task time   {sum(m['task_ms'] for m in rows) / 1000:.0f}s"
-          f"   ({sum(m['task_ms'] for m in rows) / 1000 / max(wall, 1):.1f}x wall"
+    print(f"  total bytes read           {gb(tot['input_bytes'])}")
+    print(f"  total bytes shuffled       {gb(tot['shuffle_write_bytes'])}")
+    print(f"  total executor task time   {tot['task_ms'] / 1000:.0f}s"
+          f"   ({tot['task_ms'] / 1000 / max(wall, 1):.1f}x wall"
           f" = effective parallelism)")
 
-    banner("the answer")
-    print(f"  records                    {head['records']:>14,}")
-    print(f"  usable for mapping         {100 * head['usable']:>13.2f}%")
-    print(f"  usable, uncertainty known  {100 * head['usable_strict']:>13.2f}%")
-    print(f"  carries any flag           {100 * head['any_flag']:>13.2f}%")
-    print(f"  carries a fatal geo flag   {100 * head['geo_flag']:>13.2f}%")
-    print(f"  mean flags per record      {head['mean_flags']:>14.2f}")
-    print(f"  distinct species (~2%)     {head['species']:>14,}")
-    print(f"  1-degree cells (~2%)       {head['cells']:>14,}")
-    print(f"  publishers                 {head['publishers']:>14,}")
-    print(f"\n  between-publisher variance {100 * var['between_share']:>13.0f}% of total")
-    print(f"  claim (flags describe the publisher): "
-          f"{'SUPPORTED' if var['between_share'] > 0.5 else 'NOT SUPPORTED'}")
+    job.print_answer(summary)
 
     record = {
-        "tag": args.tag,
+        "tag": cfg.tag,
         "at": started.isoformat(timespec="seconds"),
-        "table": args.table,
-        "fact_rows": state["n_facts"],
-        "dim_rows": state["n_dim"],
-        "shuffle_partitions": args.shuffle_partitions,
-        "driver_memory": args.driver_memory,
-        "cached": not args.no_cache,
+        "table": cfg.table,
+        "batches": list(cfg.batches),
+        "input_bytes_on_disk": in_bytes,
+        "fact_rows": summary["n_facts"],
+        "dim_rows": summary["n_dim"],
+        "shuffle_partitions": cfg.shuffle_partitions,
+        "max_partition_bytes": cfg.max_partition_bytes,
+        "cache": cfg.cache,
+        "join": cfg.join,
+        "join_strategy": summary["join_strategy"],
+        "aqe": cfg.aqe,
+        "aqe_skew_join": cfg.aqe_skew_join,
+        "coalesce_output": cfg.coalesce_output,
+        "write_in_place": cfg.write_in_place,
+        "cache_results": cfg.cache_results,
+        "driver_memory": cfg.driver_memory,
         "wall_seconds": round(wall, 1),
-        "verified": state["verified"],
+        "verified": summary["verified"],
         "stages": [{k: m.get(k, 0) for k in
                     ("label", "seconds", "input_bytes", "files_read",
                      "scan_rows", "shuffle_write_bytes", "shuffle_read_bytes",
                      "disk_spill_bytes", "tasks", "task_ms")} for m in rows],
-        "result_bytes": sizes,
-        "headline": {k: head[k] for k in head.asDict()},
-        "variance": var,
+        "result_bytes": summary["result_bytes"],
+        "headline": summary["headline"],
+        "variance": summary["variance"],
     }
     REPORTS.mkdir(parents=True, exist_ok=True)
-    with (REPORTS / "runs.jsonl").open("a") as f:
+    with RUNS.open("a") as f:
         f.write(json.dumps(record, default=float) + "\n")
-    print(f"\nappended to {REPORTS / 'runs.jsonl'}   "
-          f"(uv run python day9.py --report)")
+    print(f"\nappended to {RUNS}   (uv run python day9.py --report)")
 
     spark.stop()
     print("\ndone.")
 
 
+def load_runs():
+    if not RUNS.exists():
+        return []
+    return [json.loads(l) for l in RUNS.open() if l.strip()]
+
+
 def print_report():
-    p = REPORTS / "runs.jsonl"
-    if not p.exists():
-        return print("no runs yet")
-    runs = [json.loads(l) for l in p.open()]
+    runs = load_runs()
+    if not runs:
+        return print("no runs yet - try: uv run python day9.py --batches b0000,b0003")
     banner(f"{len(runs)} runs")
-    print(f"  {'tag':<14}{'when':<18}{'rows':>13}{'shuf':>6}{'cache':>7}"
+    print(f"  {'tag':<16}{'when':<18}{'rows':>15}{'shuf':>6}{'cache':>16}"
           f"{'wall s':>9}{'read':>11}{'shuffled':>11}  ok")
     for r in runs:
         rd = sum(s["input_bytes"] for s in r["stages"])
         sh = sum(s["shuffle_write_bytes"] for s in r["stages"])
-        print(f"  {r['tag'][:13]:<14}{r['at'][:16]:<18}{r['fact_rows']:>13,}"
-              f"{r['shuffle_partitions']:>6}{str(r['cached']):>7}"
+        print(f"  {r['tag'][:15]:<16}{r['at'][:16]:<18}{r['fact_rows']:>15,}"
+              f"{r['shuffle_partitions']:>6}{str(r.get('cache')):>16}"
               f"{r['wall_seconds']:>9.1f}{gb(rd):>11}{gb(sh):>11}"
               f"  {'y' if r.get('verified') else 'n'}")
     banner("stage breakdown, most recent run")

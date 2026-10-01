@@ -208,6 +208,48 @@ def curate(df):
                         F.regexp_extract(F.input_file_name(), r"([^/]+)$", 1))
 
 
+# --- reading it back --------------------------------------------------------
+def read_table(spark, path=DEFAULT_OUT, batches=None):
+    """Read the curated table, or only some of its ingest batches.
+
+    Week 3 is measurement, and a measurement you only run once is a guess. The
+    full table is 90 GB / 2.2 billion rows, so every experiment that needs to
+    run ten times runs on a named subset instead, and the subset is named in
+    the output so nobody compares two numbers from different amounts of data.
+
+        read_table(spark)                      # all 33 batches, 90 GB
+        read_table(spark, batches=["b0004"])   # one batch, 5.7 GB
+
+    `basePath` is the part that is easy to get wrong: point Spark at
+    `.../ingest_batch=b0004` and it reads that directory as the root, so
+    `ingest_batch` stops being a column and `decade` becomes the outer
+    partition. Giving it the table root as basePath keeps both columns, which
+    keeps partition pruning available on both.
+    """
+    if not batches:
+        return spark.read.parquet(path)
+    paths = [f"{path.rstrip('/')}/ingest_batch={b}" for b in batches]
+    missing = [p for p in paths if not pathlib.Path(p).is_dir()]
+    if missing:
+        raise SystemExit(f"no such batch: {', '.join(missing)}")
+    return spark.read.option("basePath", path).parquet(*paths)
+
+
+def batch_names(path=DEFAULT_OUT):
+    """Batch directory names, sorted, straight off disk."""
+    root = pathlib.Path(path)
+    return sorted(d.name.split("=", 1)[1] for d in root.glob("ingest_batch=*"))
+
+
+def table_bytes(path=DEFAULT_OUT, batches=None):
+    """On-disk size of what read_table would read. Reported next to every
+    timing, because a time without a data size is not a measurement."""
+    root = pathlib.Path(path)
+    dirs = ([root / f"ingest_batch={b}" for b in batches] if batches
+            else [root])
+    return sum(f.stat().st_size for d in dirs for f in d.rglob("*.parquet"))
+
+
 # --- manifest ---------------------------------------------------------------
 def manifest_path(out):
     MANIFEST_DIR.mkdir(parents=True, exist_ok=True)
