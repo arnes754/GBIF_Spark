@@ -33,12 +33,10 @@ TABLE = os.environ.get("TABLE", "data/curated/occurrence_slim")
 SLOW = os.environ.get("SLOW", "0") == "1"
 HOLD_FOR_UI = os.environ.get("HOLD_FOR_UI") == "1"
 
-# 4g, not 8g. Section 5 forks a python worker per core, and each one imports
+# 4g, not 8g. Section 5 forks one python worker per core and each imports
 # pandas and pyarrow (~150 MB resident). Twelve of those next to an 8 GB JVM
-# does not fit in 16 GB of RAM, and the failure mode is not an error - the
-# workers are killed by the OS, the JVM waits forever for results that will
-# never come, and the job hangs with 12 active tasks and 0 completed. Leaving
-# headroom for the python side is part of sizing the driver.
+# does not fit in 16 GB, and it does not raise: the OS kills the workers and
+# the job hangs with 12 active tasks and 0 completed.
 spark = gbif.spark_session(app="gbif-day6", driver_memory="4g",
                            shuffle_partitions=24)
 spark.sparkContext.setLogLevel("ERROR")
@@ -123,8 +121,8 @@ print(f"""
   Same operator, three orders of magnitude apart, and the difference is the
   number of GROUPS, not the number of rows. Low cardinality: the map side
   reduces 58M rows to ~250 per partition and shuffles nothing. High
-  cardinality: the map side cannot reduce anything, so the shuffle is the
-  whole dataset plus serialisation overhead - it is strictly worse than not
+  cardinality: the map side cannot reduce anything, so the shuffle carries
+  the whole dataset plus serialisation overhead, which costs more than not
   aggregating at all.
 
   This is the cardinality-explosion trap in a single table. Before you write
@@ -156,12 +154,11 @@ print("""
   Several exact distincts in one agg is worse than the sum of its parts -
   Spark expands the rows once per distinct column before shuffling.
 
-  If the answer is a headline number on a slide, 5% error is free accuracy you
-  are throwing away time on.""")
+  For a headline number, 5% error is usually an acceptable trade.""")
 
 # ---------------------------------------------------------------------------
 banner("5. the same transformation, three ways to write it")
-# Python UDF vs pandas UDF vs built-in. SCOPE.md day 8 asks for this, and the
+# Python UDF vs pandas UDF vs built-in. The
 # result is meant to be deleted afterwards - the point is the measurement.
 from pyspark.sql.types import IntegerType
 
@@ -176,8 +173,8 @@ from pyspark.sql.types import IntegerType
 UDF_ROWS = int(os.environ.get("UDF_ROWS", 50_000))
 UDF_WORKERS = int(os.environ.get("UDF_WORKERS", 4))
 # repartition, not coalesce: limit() produces a single partition and coalesce
-# cannot go UP, so coalesce(4) here would silently leave one task doing all the
-# work - the day-4 lesson, met again in the wild.
+# cannot increase the count, so coalesce(4) would leave one task doing all
+# the work.
 sample = (df.select("n_issues", "n_geo_issues")
             .where(F.col("decade") == 2000).limit(UDF_ROWS)
             .repartition(UDF_WORKERS).cache())
@@ -312,11 +309,10 @@ print(f"""
   spilled 3.8 GB - that is what pressure looks like, and it came from
   cardinality, not from this setting.
 
-  AQE reads map-side statistics and coalesces post-shuffle partitions by
-  itself, which is why 200 stopped being a problem in practice - but it only
-  coalesces DOWNWARD. It cannot create more partitions than you asked for, so
-  a too-low setting stays too low. gbif.py's 24 is fine at 2.3 GB and is
-  almost certainly wrong at 266 GB.""")
+  AQE reads map-side statistics and coalesces post-shuffle partitions
+  itself, so an over-large setting mostly stops mattering. It only coalesces
+  downward though: it cannot create more partitions than requested, so a
+  too-low setting stays too low.""")
 
 # ---------------------------------------------------------------------------
 banner("8. caching: when it pays and when it is a tax")
@@ -349,7 +345,7 @@ print("""
   pruning, so recomputation is already cheap and the cache barely wins. Over
   S3, or after a shuffle, the same three lines look very different.
 
-  The honest default: do not cache. Add it when a measurement says to.""")
+  Default to not caching, and add it when a measurement says to.""")
 
 # ---------------------------------------------------------------------------
 if SLOW:
@@ -374,9 +370,8 @@ if SLOW:
     show(runs)
     print("""
   Catalyst reorders filters past sorts when it can prove it is safe, so the
-  two orderBy lines may come out closer than you expect - that is a finding,
-  not a failure. The repartition line is pure loss: a shuffle whose only
-  product is more partitions.""")
+  two orderBy lines can come out close together. The repartition line is pure
+  loss: a shuffle whose only product is more partitions.""")
 
 # ---------------------------------------------------------------------------
 banner("10. notes")

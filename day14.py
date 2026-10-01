@@ -1,39 +1,16 @@
-"""Week 3, day 5 (day 14) - before and after.
+"""Run the job under several configurations and compare them.
 
-Four days of measurements are worth nothing until the same job is run both
-ways, on the same data, and the difference is written down. This script does
-that and nothing else.
+Each configuration is a fresh day9.py subprocess rather than a loop inside one
+session: a session keeps cached blocks, a warm JIT and conf values from the
+previous experiment, so a loop measures the order things ran in. The OS page
+cache is still shared, so --warm reads each slice once before the matrix
+starts and every configuration sees the same warm cache.
 
-HOW IT RUNS THEM. Each configuration is a fresh `day9.py` subprocess, not a
-loop inside one session. That is deliberate and it is the bit that is easy to
-get wrong: a Spark session accumulates state - cached blocks, a warm JIT,
-conf values set by an earlier experiment, a page cache full of the files the
-last run touched. Comparing two configs inside one session measures the order
-you ran them in as much as the configs. A new JVM per run is slower and it is
-the only version of the number that is worth printing.
+The configurations are defined in CONFIGS below as day9.py flags.
 
-The page cache is still shared across processes, so the FIRST run of a slice
-pays for cold files and the rest do not. `--warm` reads the slice once before
-the matrix starts, so every configuration gets the same warm cache.
-
-WHAT IS BEING COMPARED.
-
-  before   day 9's defaults: persist the enriched fact table in
-           MEMORY_AND_DISK, 48 shuffle partitions, AQE on.
-  nocache  the same job with the cache removed and nothing else changed.
-  after    also stops computing every aggregate twice (day 10's finding) and
-           persists the one small, expensive intermediate instead (day 13's).
-
-Three configurations and not two, because "we changed five things and it got
-faster" is not a measurement. Each row isolates one change from the one above
-it, so the table attributes the difference instead of just showing it.
-
-Two slices, because the interesting part of this comparison is not a
-percentage - it is that the configurations do not even fail in the same place.
-
-    uv run python day14.py                       # the matrix, then the table
-    uv run python day14.py --report              # just re-print from runs.jsonl
-    uv run python day14.py --slices b0003,b0000,b0004
+    uv run python day14.py
+    uv run python day14.py --slices b0003,b0000,b0004 --warm
+    uv run python day14.py --report
 """
 import argparse
 import json
@@ -53,38 +30,32 @@ HERE = pathlib.Path(__file__).parent
 RUNS = HERE / "data" / "reports" / "runs.jsonl"
 OUT = HERE / "data" / "scratch" / "day14"
 
-# The two configurations the week is about. Each value is a list of day9.py
-# flags, so this table is the complete and only definition of "before" and
-# "after" - no setting is applied anywhere else.
+# Each value is a list of day9.py flags. Three configurations rather than two
+# so the middle one isolates the cache change from the rest.
 CONFIGS = {
-    # day 9 as shipped: cache the enriched fact table, compute every aggregate
-    # once to time it and once again to write it.
+    # The original: cache the fact table, and compute every aggregate once to
+    # time it and again to write it.
     "before":  ["--cache", "memory_and_disk",
                 "--no-write-in-place", "--no-cache-results"],
-    # day 13 only: drop the cache, change nothing else. This isolates the
-    # change from the next one, which is the whole reason there are three
-    # configurations and not two.
+    # Drop the cache, change nothing else.
     "nocache": ["--cache", "none",
                 "--no-write-in-place", "--no-cache-results"],
-    # day 13 + day 10: no fact-table cache, each aggregate written by the stage
-    # that built it, and the one small expensive intermediate persisted.
-    "after":   [],          # job.py's defaults ARE week 3's conclusions
+    # No fact-table cache, each aggregate written by the stage that built it,
+    # and the small intermediate persisted. These are job.py's defaults.
+    "after":   [],
 }
 
 
 def run_once(slice_name, config_name, timeout_s):
-    """One day9.py run. Returns a dict even when it fails - a configuration
-    that cannot finish is a result, and silently dropping it would turn this
-    table into a comparison of the runs that happened to survive.
+    """One day9.py run. Returns a dict even on failure: a configuration that
+    cannot finish is a result, and dropping it would leave a table comparing
+    only the runs that survived.
 
-    The subprocess gets its own process GROUP, and the group is killed
-    afterwards whether the run succeeded or not. This is not tidiness. When
-    day9.py dies of an OutOfMemoryError the python process exits but the JVM it
-    started does not - it is a child of a dead parent, it keeps its ~4 GB and
-    it keeps port 4040. The next run then starts on a machine with half the
-    memory gone, binds its UI to 4041, and fails in six seconds with an
-    unrelated NullPointerException. Two of the three configurations in this
-    matrix exist to OOM on purpose, so this is the normal case, not an edge.
+    The subprocess gets its own process group, killed afterwards whether the
+    run succeeded or not: when day9.py dies of an OutOfMemoryError the python
+    process exits but the JVM it started does not, and it keeps its heap and
+    the UI port. The next run then starts short of memory and fails during
+    startup for an unrelated-looking reason.
     """
     tag = f"{config_name}-{slice_name}"
     cmd = [sys.executable, "-u", str(HERE / "day9.py"),
@@ -124,17 +95,16 @@ def run_once(slice_name, config_name, timeout_s):
 
 
 def reap(pid):
-    """Kill the whole process group and wait for the machine to be quiet again.
+    """Kill the process group and wait for the JVM to actually be gone.
 
-    SIGKILL rather than SIGTERM: a JVM whose heap is exhausted may never get
-    far enough through its shutdown hooks to notice a polite signal.
+    SIGKILL, not SIGTERM: a JVM out of heap may never reach its shutdown
+    hooks.
     """
     try:
         os.killpg(os.getpgid(pid), signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
         pass
-    # Give the OS a moment to release the memory and the UI port before the
-    # next run starts measuring.
+    # Let the OS release the memory and the UI port before the next run.
     for _ in range(40):
         if not java_running():
             return
@@ -148,15 +118,12 @@ def java_running():
 
 
 def classify_failure(stderr):
-    """Say WHY it failed in three words, from the stderr we already have.
-    'it crashed' is not a measurement; 'OutOfMemoryError in the cache stage'
-    is the finding."""
+    """Short reason for a failure, from the stderr already captured."""
     if "OutOfMemoryError" in stderr:
         return "OOM (java heap)"
     if "SparkEnv" in stderr and "NullPointerException" in stderr:
-        # Not this run's fault: a previous run's JVM was still holding memory
-        # and the UI port. `reap()` exists to stop this happening; if it shows
-        # up anyway, the matrix is not measuring what it says it is.
+        # A previous run's JVM was still holding memory and the UI port.
+        # reap() should prevent this.
         return "startup clash - a previous JVM outlived its run"
     if "timed out" in stderr:
         return stderr
@@ -199,9 +166,8 @@ def print_matrix(rows):
         if not b["ok"] and a["ok"]:
             print(f"    before : FAILED - {b['note']}")
             print(f"    after  : {a['job_s']:.1f}s, verified")
-            print(f"    -> not a speedup. The job went from not running to "
-                  f"running, which is\n       the only kind of improvement "
-                  f"that cannot be argued with.")
+            print("    -> not a speedup: the job went from not completing "
+                  "to completing.")
             continue
         if not (b["ok"] and a["ok"]):
             print(f"    both configurations did not complete - nothing to compare")
@@ -223,17 +189,14 @@ def print_matrix(rows):
 
 
 def print_stage_delta(rows):
-    """Which stage the difference came from. A total that moved without a
-    stage moving means something was measured wrong."""
+    """Which stage the difference came from."""
     pairs = {}
     for r in rows:
         if r["ok"]:
             pairs.setdefault(r["slice"], {})[r["config"]] = r
     for sl, pair in pairs.items():
-        # The baseline is whichever of the earlier configurations actually
-        # completed. On the slices where `before` OOMs there is no before to
-        # subtract, and `nocache` becomes the thing `after` is measured
-        # against - which is the honest comparison anyway.
+        # Baseline is whichever earlier configuration completed. Where
+        # `before` OOMs there is nothing to subtract, so `nocache` is used.
         base_name = next((c for c in CONFIGS if c in pair and c != "after"), None)
         if base_name is None or "after" not in pair:
             continue
@@ -304,47 +267,34 @@ def main():
     banner("what worked, what did not")
     print("""  WORKED
 
-  Removing the cache (day 13). The only change this week that moved anything,
-  and it did not move a percentage - it moved the job from "OOMs above 1 GB"
-  to "completes". The cached thing was a parquet scan plus a broadcast join:
-  cheap to recompute, expensive to store, and impossible to column-prune once
-  cached.
+  Removing the fact-table cache. It did not move a percentage, it moved the
+  job from OOMing above 1 GB to completing. The cached thing was a parquet
+  scan plus a broadcast join: cheap to recompute, expensive to store, and
+  impossible to column-prune once cached.
 
-  DID NOT WORK - and these are the more useful four days
+  Writing each aggregate in the stage that built it. Every result DataFrame
+  used to be forced with count() to time it and then recomputed by the write
+  stage: 22 passes over the fact table for 11 outputs, now 13.
 
-  Shuffle partitions (day 11). The job's shuffles are kilobytes. Every
-  aggregate reduces hard on the map side, so there is almost nothing crossing
-  the exchange, and 48 vs 200 vs 800 is 48 vs 200 vs 800 near-empty tasks.
-  AQE coalesces them anyway. No change made.
+  DID NOT WORK
 
-  Input partitioning (day 11). The curated table's files are already close to
-  maxPartitionBytes, so the default 128 MB already produces roughly one task
-  per file and saturates twelve cores. No change made.
+  Shuffle partitions. The shuffles are kilobytes because every aggregate
+  reduces on the map side, so 48 vs 800 is 48 vs 800 near-empty tasks and
+  AQE coalesces them anyway.
 
-  Partition pruning (day 11). The table is partitioned by decade and the job
-  filters on nothing, so the layout does not help it at all. Kept anyway,
-  because day 15's analysis and the ad-hoc queries in days 5-8 do filter on
-  decade - but it is a cost this job carries for someone else's benefit, and
-  that is worth being explicit about rather than claiming it as a win.
+  Input partitioning. The default 128 MB already packs the slice into about
+  one task per core. 32 MB is worse.
 
-  Broadcast joins (day 12). Already happening. The dimension is 0.2 MB of
-  parquet, Spark has a real size statistic for it, and it broadcasts without
-  being asked. Adding F.broadcast() changed nothing measurable and would have
-  been a hint to maintain forever.
+  Partition pruning. The job filters on nothing, so the decade layout does
+  not help it. It stays for the ad-hoc queries that do filter on decade.
 
-  Skew handling (day 12). datasetkey is genuinely skewed - the top ten keys
-  hold a large share of the rows - but the join is a broadcast, so there is no
-  shuffle, so there is no skew to handle. AQE's skew join stays on because it
-  is free when idle, not because it is doing anything today.
+  Broadcast joins. Already happening: the dimension is 0.2 MB of parquet and
+  Spark has a real size statistic for it. F.broadcast() changed nothing and
+  would be a hint to maintain.
 
-  THE HONEST SUMMARY
-
-  Four of the five optimisation days ended in "no change, and here is the
-  measurement that says why". That is what measuring first buys you: four
-  changes not made, each one a thing that would have been code to maintain,
-  a number in a config file nobody could justify, and a plausible-sounding
-  slide with nothing behind it.""")
-
+  Skew handling. datasetkey is heavily skewed, but the join is a broadcast,
+  so there is no shuffle and no skew to handle. AQE skew join stays on
+  because it costs nothing when idle.""")
 
 if __name__ == "__main__":
     main()

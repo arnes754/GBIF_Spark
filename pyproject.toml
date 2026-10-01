@@ -1,11 +1,15 @@
 [project]
 name = "datamonth3"
 version = "0.1.0"
-description = "Spark over the GBIF occurrence snapshot: curated table, one question, measured tuning"
+description = "PySpark pipeline over the GBIF occurrence snapshot"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.13,<3.14"
 dependencies = [
-    "pandas<3",
-    "pyarrow>=25.0.1",
-    "pyspark>=4.2.0",
+    # Exact versions this was developed and measured against. uv.lock pins the
+    # full transitive tree; these bounds keep a plain `pip install .` close.
+    "pyspark==4.2.0",
+    "pyarrow==25.0.1",
+    # PySpark 4.2 warns that pandas >= 3 is not fully supported, and the
+    # pandas-UDF benchmark in day6.py needs to run.
+    "pandas>=2.3,<3",
 ]

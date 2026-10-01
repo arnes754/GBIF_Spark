@@ -1,28 +1,25 @@
-"""Curated occurrence table: materialise a slice once, append more later.
+"""Build the curated occurrence table from the GBIF snapshot on S3.
 
-The point is to stop paying S3 for every run. `build` pulls shards that are not
-already in the table, transforms them, and appends. Run it again with a bigger
---gb and you get MORE data, not the same data twice.
+`build` pulls shards that are not already in the table, transforms them and
+appends. Running it again with a bigger --gb adds more data, not the same data
+twice.
 
     uv run python curate.py build --gb 2      # first 2 GB
     uv run python curate.py status            # what is in the table
-    uv run python curate.py build --gb 4      # +4 GB of DIFFERENT shards
+    uv run python curate.py build --gb 4      # +4 GB of different shards
     uv run python curate.py preview           # read it back, sanity numbers
     uv run python curate.py compact           # fix the small-file problem
     uv run python curate.py drop-batch b0003  # undo one append
 
 Layout: data/curated/occurrence_slim/ingest_batch=bNNNN/decade=YYYY/*.parquet
 
-  - `ingest_batch` first so an append is pure file creation: nothing existing is
-    touched, and a half-finished run is undone with `drop-batch`. That is the
-    whole crash-safety story - no table format, no transaction log.
-  - `decade` second because every question in SCOPE.md groups or filters by
-    time, so it is the partition that earns its keep at read.
-  - Cost: batches x decades directories. `compact` collapses them into one
-    batch, and trades away per-batch rollback to do it.
+ingest_batch is the outer partition so an append only creates files: nothing
+existing is touched and a half-finished run is undone with drop-batch. decade
+is inner because the queries filter and group by time. The cost is
+batches x decades directories, which `compact` collapses at the price of
+per-batch rollback.
 
-State lives in data/manifests/<table>.json, not in the table. It is local-only,
-which is exactly the limitation a real table format (Iceberg, Delta) removes.
+Which shards are already in the table lives in data/manifests/<table>.json.
 """
 import argparse
 import datetime
@@ -39,14 +36,13 @@ HERE = pathlib.Path(__file__).parent
 DEFAULT_OUT = str(HERE / "data" / "curated" / "occurrence_slim")
 MANIFEST_DIR = HERE / "data" / "manifests"
 
-# --- transformation policy, all in one place so day 16 can move them ---------
+# --- transformation thresholds ----------------------------------------------
 UNCERTAINTY_MAX_M = 10_000.0   # 1-degree cell is ~111 km; 10 km is generous
 MIN_PLAUSIBLE_YEAR = 1600      # below this, `year` is a typo more often than not
 MAX_UNCERTAINTY_SANE = 20_000_000.0   # > Earth's circumference/2, clearly junk
 
-# Issue flags that make a coordinate unusable for mapping. Deliberately NOT
-# "any flag": day 2 found 93% of records flagged and the top flag (82%,
-# CONTINENT_DERIVED_FROM_COORDINATES) is informational.
+# Issue flags that make a coordinate unusable. Not "any flag": 93% of records
+# carry some flag and the most common one is informational.
 GEO_FATAL = [
     "ZERO_COORDINATE",
     "COORDINATE_INVALID",
@@ -58,8 +54,7 @@ GEO_FATAL = [
     "PRESUMED_NEGATED_LONGITUDE",
 ]
 
-# 50 columns in, these out. Everything dropped is either >99% null (day 2) or
-# irrelevant to the one question.
+# 50 columns in the snapshot, these out. The rest are >99% null or unused.
 SOURCE_COLUMNS = [
     "gbifid", "datasetkey", "publishingorgkey", "institutioncode", "license",
     "kingdom", "phylum", "class", "order", "family", "genus", "species",
@@ -103,18 +98,16 @@ def curate(df):
     """Raw occurrence rows -> curated rows. Pure: no I/O, no session state, so
     it can be tested against a five-row DataFrame built by hand.
 
-    Rule: this NEVER drops a row. The question in SCOPE.md is *what fraction*
-    of GBIF is usable, so the filter has to be a column you can group by, not
-    a `where` that deletes the evidence.
+    Never drops a row. The question is what fraction of the data is usable,
+    so every filter is a column you can group by rather than a `where`.
     """
     cols = [c for c in SOURCE_COLUMNS if c in df.columns]
     d = df.select(*cols)
 
-    # 1. issue: array<struct<array_element:string>> -> array<string>, sorted.
-    #    transform() on a NULL array returns NULL, so coalesce to empty - then
-    #    size() is 0 instead of null and array_contains works everywhere.
-    #    Sorting makes two records with the same flags compare equal, which is
-    #    what the per-publisher flag-vector work needs.
+    # 1. issue: array<struct<array_element:string>> -> sorted array<string>.
+    #    transform() on a NULL array returns NULL, so coalesce to an empty
+    #    array; size() is then 0 and array_contains works. Sorting makes two
+    #    records with the same flags compare equal.
     d = d.withColumn("issues", F.expr(
         "coalesce(array_sort(transform(issue, x -> x.array_element)),"
         " cast(array() as array<string>))"))
@@ -125,8 +118,8 @@ def curate(df):
          .withColumn("has_geo_issue", F.col("n_geo_issues") > 0)
          .drop("issue"))
 
-    # 2. categoricals: trim, upcase, and turn "" into NULL. GBIF ships both;
-    #    without this, "" and NULL are two different groups in every groupBy.
+    # 2. categoricals: trim, upcase, "" -> NULL. GBIF ships both, and
+    #    otherwise they are two separate groups in every groupBy.
     for c, new in [("basisofrecord", "basis"), ("occurrencestatus", "status"),
                    ("countrycode", "country"), ("taxonrank", "taxon_rank")]:
         if c in d.columns:
@@ -134,30 +127,28 @@ def curate(df):
             d = d.withColumn(new, F.when(t == "", None).otherwise(t)).drop(c)
     d = d.withColumn("is_present", F.col("status") == "PRESENT")
 
-    # `class` and `order` are SQL keywords - renaming here saves backticks in
-    # every query written from now on.
+    # class and order are SQL keywords; rename once instead of backticking.
     for c, new in [("class", "taxon_class"), ("order", "taxon_order")]:
         if c in d.columns:
             d = d.withColumnRenamed(c, new)
 
-    # 3. time. decade is the partition column, so it must never be NULL:
-    #    unknown year becomes 0, an explicit bucket you can count.
+    # 3. time. decade is a partition column so it must never be NULL:
+    #    unknown year becomes an explicit 0 bucket.
     plausible = F.col("year").isNotNull() & (F.col("year") >= MIN_PLAUSIBLE_YEAR)
     d = (d
          .withColumn("year_known", plausible)
          .withColumn("decade", F.when(plausible,
                                       (F.col("year") / 10).cast("int") * 10)
                                .otherwise(F.lit(0)))
-         # when GBIF last reprocessed the record - the claim in SCOPE.md says
-         # this predicts flags better than the observation does, so it has to
-         # be a first-class grouping key, not a timestamp nobody can group on
+         # When GBIF last reprocessed the record, as a groupable key rather
+         # than a timestamp.
          .withColumn("interpreted_month",
                      F.date_format(F.to_timestamp("lastinterpreted"), "yyyy-MM"))
          .withColumn("interpreted_year",
                      F.year(F.to_timestamp("lastinterpreted"))))
 
-    # 4. space. Three separate booleans, not one: "no coordinate" and "a
-    #    coordinate that is a lie" are different findings and get counted apart.
+    # 4. space. Three booleans rather than one: a missing coordinate and a
+    #    wrong coordinate are different things and are counted separately.
     lat, lon = F.col("decimallatitude"), F.col("decimallongitude")
     unc = F.col("coordinateuncertaintyinmeters")
     d = (d
@@ -167,11 +158,11 @@ def curate(df):
                      lat.isNotNull() & lon.isNotNull()
                      & lat.between(-90, 90) & lon.between(-180, 180)
                      & ~((lat == 0) & (lon == 0)))
-         # negative and absurd uncertainties exist; they are not information
+         # Negative and absurd uncertainties exist and are not information.
          .withColumn("uncertainty_m",
                      F.when((unc >= 0) & (unc <= MAX_UNCERTAINTY_SANE), unc))
-         # 1-degree grid: floor, not round, so a cell is [n, n+1) and the cell
-         # id names its own south-west corner
+         # 1-degree grid. floor, not round, so a cell is [n, n+1) and its id
+         # names its own south-west corner.
          .withColumn("cell_lat", F.when(F.col("coord_valid"),
                                         F.floor(lat).cast("int")))
          .withColumn("cell_lon", F.when(F.col("coord_valid"),
@@ -187,13 +178,11 @@ def curate(df):
                      F.col("uncertainty_m").isNull()
                      | (F.col("uncertainty_m") <= UNCERTAINTY_MAX_M)))
 
-    # 5. the gate. One boolean that encodes the downstream use from SCOPE.md
-    #    section 1, so the headline number is `avg(usable_for_mapping)` and
-    #    every breakdown is a groupBy away.
-    #    uncertainty_ok passes NULL uncertainty on purpose - most records have
-    #    none, and dropping them would answer a different question. Keeping
-    #    `uncertainty_known` as its own column means the strict variant
-    #    (usable_for_mapping AND uncertainty_known) needs no rebuild.
+    # 5. the gate: one boolean for "usable for 1-degree species mapping", so
+    #    the headline is avg(usable_for_mapping) and every breakdown is a
+    #    groupBy. uncertainty_ok passes NULL uncertainty on purpose - only a
+    #    third of records have one. uncertainty_known ships beside it so the
+    #    strict variant needs no rebuild.
     d = (d
          .withColumn("has_species", F.col("species").isNotNull()
                      & (F.trim("species") != ""))
@@ -202,8 +191,8 @@ def curate(df):
                      & ~F.col("has_geo_issue") & F.col("year_known")
                      & F.col("is_present") & F.col("uncertainty_ok")))
 
-    # 6. provenance. Which shard a row came from, so a suspicious number can be
-    #    traced back to a file instead of to the whole slice.
+    # 6. provenance: which shard a row came from, so an odd number can be
+    #    traced back to a file.
     return d.withColumn("src_shard",
                         F.regexp_extract(F.input_file_name(), r"([^/]+)$", 1))
 
@@ -212,19 +201,12 @@ def curate(df):
 def read_table(spark, path=DEFAULT_OUT, batches=None):
     """Read the curated table, or only some of its ingest batches.
 
-    Week 3 is measurement, and a measurement you only run once is a guess. The
-    full table is 90 GB / 2.2 billion rows, so every experiment that needs to
-    run ten times runs on a named subset instead, and the subset is named in
-    the output so nobody compares two numbers from different amounts of data.
+        read_table(spark)                      # whole table
+        read_table(spark, batches=["b0004"])   # one batch
 
-        read_table(spark)                      # all 33 batches, 90 GB
-        read_table(spark, batches=["b0004"])   # one batch, 5.7 GB
-
-    `basePath` is the part that is easy to get wrong: point Spark at
-    `.../ingest_batch=b0004` and it reads that directory as the root, so
-    `ingest_batch` stops being a column and `decade` becomes the outer
-    partition. Giving it the table root as basePath keeps both columns, which
-    keeps partition pruning available on both.
+    basePath matters: without it Spark treats .../ingest_batch=b0004 as the
+    root, ingest_batch stops being a column and decade becomes the outer
+    partition. Passing the table root keeps both columns prunable.
     """
     if not batches:
         return spark.read.parquet(path)
@@ -242,8 +224,7 @@ def batch_names(path=DEFAULT_OUT):
 
 
 def table_bytes(path=DEFAULT_OUT, batches=None):
-    """On-disk size of what read_table would read. Reported next to every
-    timing, because a time without a data size is not a measurement."""
+    """On-disk size of what read_table would read."""
     root = pathlib.Path(path)
     dirs = ([root / f"ingest_batch={b}" for b in batches] if batches
             else [root])
@@ -297,20 +278,15 @@ def cmd_build(args):
     spark = gbif.spark_session(app=f"gbif-curate-{batch}",
                                driver_memory=args.driver_memory)
     spark.sparkContext.setLogLevel("ERROR")
-    if args.minio:
-        gbif.use_minio(spark)
 
     t0 = time.perf_counter()
     raw = spark.read.parquet(*[f"s3a://{gbif.BUCKET}/{k}" for k in keys])
     d = curate(raw).withColumn("ingest_batch", F.lit(batch))
 
-    # repartition by decade before the write, or every input task writes into
-    # every decade directory: tasks x decades files per batch. One shuffle now
-    # buys ~one file per decade. maxRecordsPerFile then splits the two fat
-    # decades (2010s, 2020s) back into readable chunks.
-    # sortWithinPartitions is not cosmetic: it gives each parquet row group a
-    # tight min/max on datasetkey, which is what makes a later predicate on
-    # datasetkey skip row groups instead of reading them.
+    # Repartition by decade first, or every task writes into every decade
+    # directory (tasks x decades files per batch). maxRecordsPerFile then
+    # splits the two fat decades back up. sortWithinPartitions tightens each
+    # row group's min/max on datasetkey so a later predicate can skip groups.
     (d.repartition(F.col("decade"))
       .sortWithinPartitions("datasetkey", "specieskey")
       .write
@@ -365,8 +341,6 @@ def cmd_status(args):
 def cmd_preview(args):
     spark = gbif.spark_session(app="gbif-curate-preview")
     spark.sparkContext.setLogLevel("ERROR")
-    if args.minio:
-        gbif.use_minio(spark)
     d = spark.read.option("mergeSchema", "true").parquet(args.out)
 
     banner("schema")
@@ -402,8 +376,8 @@ def cmd_compact(args):
     """Rewrite every batch into one. Fixes the file count that repeated appends
     create; costs you per-batch rollback, which is the trade."""
     out = pathlib.Path(args.out)
-    if args.minio or str(out).startswith("s3a://"):
-        raise SystemExit("compact is local-only for now")
+    if str(out).startswith("s3a://"):
+        raise SystemExit("compact only works on a local table")
     m = load_manifest(args.out)
     if len(m["batches"]) < 2:
         print("fewer than 2 batches, nothing to compact")
@@ -458,13 +432,9 @@ def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--out", default=DEFAULT_OUT)
-    p.add_argument("--minio", action="store_true",
-                   help="write via the docker-compose MinIO instead of local disk")
     p.add_argument("--max-records-per-file", type=int, default=2_000_000)
-    # The build is network-bound, not heap-bound - it streams shards through a
-    # narrow transform and writes them straight back out. A large heap buys
-    # nothing here and, on a 16 GB laptop, competes with everything else for
-    # hours. Lower it when the machine is busy.
+    # The build is network-bound, not heap-bound: shards stream through a
+    # narrow transform and go straight back out. A big heap buys nothing.
     p.add_argument("--driver-memory", default="4g")
     p.add_argument("--compression", default="snappy",
                    choices=["snappy", "zstd", "gzip", "none"])

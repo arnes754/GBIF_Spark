@@ -6,7 +6,7 @@ rows. That difference is the whole day, and it is the difference between
 "which publisher has the most records" and "is this publisher's flag mix
 unusual for its size".
 
-SCOPE.md's claim needs the second kind. "Flag mix varies more BETWEEN
+The claim under test needs the second kind. "Flag mix varies more BETWEEN
 publishers than WITHIN them" is a variance decomposition, and every term in it
 is a window or a grouped aggregate.
 
@@ -31,7 +31,7 @@ HOLD_FOR_UI = os.environ.get("HOLD_FOR_UI") == "1"
 # on part of it; day 6 proved that an oversized JVM heap plus anything else
 # ends in the OS killing processes rather than in a Spark error. The curated
 # table is 2.3 GB with column pruning on top, so 4 GB is not the constraint -
-# see logs/gotchas.md.
+# see the note in day6.py.
 spark = gbif.spark_session(app="gbif-day8", driver_memory="4g",
                            shuffle_partitions=48)
 spark.sparkContext.setLogLevel("ERROR")
@@ -208,7 +208,7 @@ print(f"  between-publisher var : {v['between']:.4f}   ({100 * v['between'] / to
 verdict = ("SUPPORTED - flag mix is mostly a publisher property"
            if v["between"] > v["within"] else
            "NOT SUPPORTED - datasets vary more within a publisher than between")
-print(f"\n  SCOPE.md section 1 claim: {verdict}")
+print(f"\n  claim: {verdict}")
 print("""
   Stated this way the claim is falsifiable by one number, which is what a
   claim is for. Day 16's job is to attack it: record age and GBIF's
@@ -350,7 +350,7 @@ print(f"""findings
     columns, catastrophic the moment a high-cardinality one joins them
   - a window replaces aggregate-then-join-back with a single shuffle, and keeps
     the row. That is the reason to learn them
-  - the SCOPE.md claim reduces to between- vs within-publisher variance, which
+  - the claim reduces to between- vs within-publisher variance, which
     is two window columns and one agg. Verdict this run: {verdict.split(' - ')[0]}
   - window partitions cannot be reduced map-side and AQE will not split them,
     so skew hurts a window more than a join. Aggregate first, window second

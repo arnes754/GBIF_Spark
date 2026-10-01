@@ -1,32 +1,13 @@
-"""Measuring a Spark job instead of having opinions about it.
-
-Every "is this faster" question from here to day 9 needs the same numbers:
-wall time, bytes read, bytes shuffled, bytes spilled. Wall time alone lies - a
-query can be faster because the page cache is warm and slower because it read
-40x more data. The others say which.
-
-WHERE THE NUMBERS COME FROM, and why it is not the obvious place:
-
-  The driver serves its own UI data as JSON on :4040/api/v1. The obvious
-  endpoint is /stages, which has `inputBytes` per stage. It is wrong. Summing
-  a full scan of the 2.3 GB curated table, /stages reports 1.60 MB.
-
-  `inputBytes` comes from Hadoop's FileSystem.Statistics, which are collected
-  per-thread and only for filesystems that bother to update them. Reading local
-  parquet through Spark's vectorised reader mostly bypasses that accounting, so
-  the counter stays near zero. It is not a bug you can fix - it is a metric
-  that does not mean what its name suggests.
-
-  /SQL/<execution> is the real source: the same data the SQL tab draws, with
-  per-OPERATOR metrics that the operators themselves emit. The Scan node
-  publishes `size of files read`, `number of files read` and `number of
-  partitions read`. Those are exact, and they are what this module reads.
-
-  This is SCOPE.md day 11's "read the Spark UI SQL tab properly", as code.
+"""Wall time, bytes read, bytes shuffled and spill for a block of Spark work.
 
     with bench.measure(spark, "count") as m:
         df.count()
     print(m)      # count  12.4s  read 2.30 GB  files 140/140  shuffle 55 KB
+
+Numbers come from the driver UI REST API, from /SQL rather than /stages.
+/stages.inputBytes is Hadoop FileSystem.Statistics, which Spark's vectorised
+parquet reader mostly bypasses - it reported 1.60 MB for a 2.3 GB scan. The
+SQL endpoint carries per-operator metrics emitted by the operators themselves.
 """
 import contextlib
 import json
@@ -34,16 +15,13 @@ import re
 import time
 import urllib.request
 
-# The UI port is NOT always 4040. Spark takes the next free port if 4040 is
-# taken, so a second session on the same machine lands on 4041 - and a
-# hardcoded 4040 then queries the WRONG application. It does not error: the
-# app id is not found there, every request 404s, and every metric comes back
-# zero. A table full of honest-looking zeroes. Ask the context where its own
-# UI is instead.
+# Only a fallback: a second session on the same machine gets 4041, and a
+# hardcoded port silently reads another application and returns zeroes.
+# ui_base() asks the context for the real URL.
 UI_FALLBACK = "http://localhost:4040"
 
-# operator metric name -> our field. Several operators can emit the same metric
-# name in one execution (two Exchanges, three Scans), so everything sums.
+# Operator metric name -> our field. The same name can appear on several
+# operators in one execution, so values are summed.
 SQL_METRICS = {
     "size of files read":        "input_bytes",
     "number of files read":      "files_read",
@@ -64,12 +42,10 @@ _NUM = re.compile(r"^([\d,]+(?:\.\d+)?)\s*([A-Za-z]+)?")
 
 
 def parse_metric(value):
-    """SQL metric values come in three shapes:
-         "18,175,670"                      a plain count
-         "701.0 MiB"                       a size
-         "total (min, med, max ...)\n9.5 s (115 ms, ...)"   an aggregated timing
-    The third is a two-line string whose second line starts with the total.
-    Returns a float in bytes, milliseconds, or units - the caller knows which.
+    """Parse a SQL metric value into a float.
+
+    Three shapes: a count ("18,175,670"), a size ("701.0 MiB"), or a two-line
+    aggregated timing whose second line starts with the total.
     """
     s = str(value)
     if "\n" in s:
@@ -84,7 +60,7 @@ def parse_metric(value):
 
 
 def ui_base(spark):
-    """This session's own UI root, straight from the context."""
+    """This session's own UI root."""
     return (spark.sparkContext.uiWebUrl or UI_FALLBACK).rstrip("/")
 
 
@@ -98,11 +74,12 @@ def _app(spark):
 
 
 def _sql(spark, after=-1):
-    """SQL executions with an id above `after`. planDescription is suppressed:
-    it is the whole formatted plan as a string and dwarfs the metrics.
+    """SQL executions with an id above `after`.
 
-    `offset` is an index into the list, not an execution id, so it is NOT a
-    safe way to say "everything after id N" - filtering on the id is."""
+    planDescription is dropped because it is the whole plan as a string.
+    `offset` indexes the list rather than matching ids, so filtering on the
+    id is the only safe way to say "everything after N".
+    """
     try:
         execs = _ui(spark, f"/applications/{_app(spark)}/sql"
                     f"?offset=0&length=100000&planDescription=false")
@@ -112,8 +89,7 @@ def _sql(spark, after=-1):
 
 
 def _stages(spark, after=-1):
-    """Stage metrics, used ONLY for task counts and executor time - the two
-    things /stages reports honestly."""
+    """Stage metrics. Used only for task counts and executor time."""
     try:
         return [s for s in _ui(spark, f"/applications/{_app(spark)}/stages?status=COMPLETE")
                 if s["stageId"] > after]
@@ -121,21 +97,15 @@ def _stages(spark, after=-1):
         return []
 
 
-# --- public UI accessors (day 10 reads the UI as data) -----------------------
+# --- public UI accessors ----------------------------------------------------
 def ui_json(spark, path):
-    """Any UI endpoint for THIS application, as parsed JSON.
-
-    The browser at :4040 and this function read the same store. Day 10's point
-    is that every number on those pages is a REST call away, so "what did the
-    UI say" can be a committed table instead of a screenshot.
-    """
+    """Any UI endpoint for this application, as parsed JSON."""
     return _ui(spark, f"/applications/{_app(spark)}{path}")
 
 
 def stage_list(spark, summaries=False):
-    """Completed stages. With summaries=True each stage carries
-    `taskMetricsDistributions` - the per-task quantiles, which is the only
-    place skew within a stage is visible as a number."""
+    """Completed stages. summaries=True adds taskMetricsDistributions, the
+    per-task quantiles that show skew inside a stage."""
     q = "?status=COMPLETE" + ("&withSummaries=true&quantiles=0,0.25,0.5,0.75,1.0"
                               if summaries else "")
     try:
@@ -160,9 +130,11 @@ def _high_water(spark):
 
 
 def _settle(spark, sql_hw, timeout=20.0):
-    """Block until the SQL executions created since `sql_hw` have appeared AND
-    stopped changing. Two conditions, because an execution is registered as
-    RUNNING first and gains its metrics only when it completes."""
+    """Wait until executions created since `sql_hw` exist and stop changing.
+
+    An execution is registered as RUNNING first and only gets its metrics when
+    it completes, so both conditions are needed.
+    """
     deadline = time.perf_counter() + timeout
     last, stable = None, 0
     while time.perf_counter() < deadline:
@@ -206,18 +178,16 @@ FIELDS = ("input_bytes", "files_read", "partitions_read", "shuffle_write_bytes",
 
 @contextlib.contextmanager
 def measure(spark, label):
-    """Time a block and attribute every SQL execution it created to it.
+    """Time a block and attribute the SQL executions it created to it.
 
-    Execution ids and stage ids only ever go up, so "created by this block" is
-    "id above the high-water mark taken before it". Which means the block MUST
-    contain an action: a lazy DataFrame creates no execution and measures zero,
-    the single easiest way to fool yourself with this harness.
+    Ids only increase, so "created by this block" means "id above the
+    high-water mark taken before it". The block must contain an action: a
+    lazy DataFrame creates no execution and measures zero.
     """
     sql_hw, stage_hw = _high_water(spark)
     m = Measurement(label=label, seconds=0.0, **{f: 0 for f in FIELDS})
-    # Which executions and stages this block owns. Day 10 needs it: a stage
-    # timing says WHERE the time went, and the only way back to WHY is the
-    # operator tree and the task distribution behind that exact id.
+    # Ids this block owns, so a timing can be traced back to the operator
+    # tree and task distribution behind it.
     m["exec_ids"], m["stage_ids"] = [], []
     t0 = time.perf_counter()
     try:
@@ -225,10 +195,8 @@ def measure(spark, label):
     finally:
         m["seconds"] = time.perf_counter() - t0
         # The SQL listener is asynchronous: the action returns before the
-        # execution and its final metrics are posted to the UI store. Reading
-        # immediately attributes this block's work to the NEXT block, which
-        # looks exactly like a correct-but-shifted table and is very hard to
-        # spot. Wait for the executions to land and settle.
+        # metrics are posted. Reading immediately shifts this block's work
+        # onto the next block.
         _settle(spark, sql_hw)
         for q in _sql(spark, sql_hw):
             m["executions"] += 1
@@ -252,9 +220,8 @@ def measure(spark, label):
 
 
 def conf_bytes(spark, key):
-    """Spark 4 returns byte-valued configs as strings with a unit suffix
-    ("10485760b", "200k"); Spark 3 returned a bare number. int() on the Spark 4
-    form raises - a one-character bug that only appears on a version bump."""
+    """Read a byte-valued config. Spark 4 returns these as strings with a unit
+    suffix ("10485760b", "200k") where Spark 3 returned a bare number."""
     v = str(spark.conf.get(key)).strip().lower()
     if v.lstrip("-").isdigit():
         return int(v)
@@ -299,19 +266,16 @@ def banner(title):
 
 
 def scan_of(spark, df, action=None):
-    """Run `action` (default: count) and return the Scan-node facts for it:
-    files read, partitions read, bytes read. This is the honest way to prove
-    partition pruning - the numbers come from the operator, not from a plan
-    string that changes format between Spark versions."""
+    """Run `action` (default count) and return files, partitions and bytes
+    read, taken from the Scan operator rather than from the plan string."""
     with measure(spark, "scan") as m:
         (action or (lambda: df.count()))()
     return m
 
 
 def scan_stats(df):
-    """PartitionFilters / PushedFilters / ReadSchema, off the executed plan.
-    The three lines that answer "did the predicate reach the files" - each one
-    a different mechanism, which is why they are reported separately."""
+    """PartitionFilters, PushedFilters and ReadSchema off the executed plan.
+    Three separate mechanisms, so they are reported separately."""
     plan = df._jdf.queryExecution().executedPlan().toString()
     out = {}
     for key in ("PartitionFilters", "PushedFilters", "ReadSchema"):

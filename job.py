@@ -1,22 +1,13 @@
-"""The job, as one importable thing instead of a script's `main()`.
-
-Week 3 is about optimising this pipeline, and you cannot optimise something you
-can only run by typing its filename. Every week-3 script needs to run the same
-nine stages with one knob moved, so the stages live here and `day9.py` became a
-CLI over them.
-
-Nothing about *what* the job computes changed when it moved - stage names,
-stage boundaries and the aggregates are day 9's. What is new is `Config`: the
-settings week 3 is allowed to turn, in one place, so a run can be described by
-a single object and written to `runs.jsonl` as one.
+"""The pipeline: read the curated table, join the publisher dimension, write
+the aggregates.
 
     cfg = Config(batches=["b0004"], shuffle_partitions=200, cache="disk")
     spark = session_for(cfg)
     stages, results, summary = run(spark, cfg)
 
-The split between `Config` and the stage functions is the point: the stage
-functions never read a global, so two runs differ by exactly the fields that
-differ in their Config, and `day14.py` can print that difference as a table.
+Every tunable setting is a field on Config and no stage reads a global, so two
+runs differ by exactly the fields that differ in their Config. day9.py is the
+CLI over this module.
 """
 import dataclasses
 import pathlib
@@ -32,8 +23,7 @@ HERE = pathlib.Path(__file__).parent
 DEFAULT_TABLE = str(HERE / "data" / "curated" / "occurrence_slim")
 DEFAULT_DIM = str(HERE / "data" / "curated" / "dataset_dim")
 
-# Spark's own default is 128 MB. Named here because day 11 moves it and a
-# magic number in a benchmark is a number nobody can argue with.
+# Spark's own default.
 DEFAULT_MAX_PARTITION_BYTES = 128 * 1024**2
 
 CACHE_MODES = ("none", "memory", "memory_and_disk", "disk")
@@ -42,32 +32,23 @@ JOIN_MODES = ("auto", "broadcast", "sortmerge")
 
 @dataclasses.dataclass
 class Config:
-    """Everything a run is allowed to differ by.
-
-    Defaults are what week 3 concluded, not what day 9 shipped - the two
-    differ in `cache`, and `day14.py` keeps day 9's value as a named
-    configuration so the before/after stays reproducible.
-    """
+    """Everything a run is allowed to differ by."""
     # --- what to read -------------------------------------------------------
     table: str = DEFAULT_TABLE
     dim: str = DEFAULT_DIM
     batches: tuple = ()           # () means the whole table
     out: str = str(HERE / "data" / "results")
 
-    # --- the knobs week 3 turns --------------------------------------------
+    # --- tuning -------------------------------------------------------------
     shuffle_partitions: int = 48
     max_partition_bytes: int = DEFAULT_MAX_PARTITION_BYTES
-    # Day 13's conclusion. Was "memory_and_disk" through day 9; persisting the
-    # fact table OOMs the driver above ~20 MB and saves nothing when it fits.
+    # Persisting the fact table OOMs the driver above ~20 MB and saves nothing
+    # when it does fit, so the default is off.
     cache: str = "none"                 # see CACHE_MODES
-    # Day 10 found the job computes every aggregate TWICE: once in its own
-    # stage to force the timing, once again in the write stage. With this on,
-    # each aggregate stage writes its own results, so the write IS the forcing
-    # and each aggregate is computed exactly once.
+    # Each aggregate stage writes its own results. Off, the write stage
+    # recomputes every aggregate a second time.
     write_in_place: bool = True
-    # Persist the per-dataset aggregate (~1.4k rows) because stages 5, 6 and 8
-    # all read it. The opposite trade to caching the fact table: small, and
-    # expensive to produce rather than cheap.
+    # Persist the per-dataset aggregate (~1.4k rows); stages 5, 6 and 8 read it.
     cache_results: bool = True
     join: str = "auto"                  # see JOIN_MODES
     aqe: bool = True
@@ -77,7 +58,7 @@ class Config:
     tag: str = "default"
 
     def describe(self):
-        """The one-line identity of a run, printed above every result table."""
+        """One-line summary of the settings, printed above each run."""
         where = ",".join(self.batches) if self.batches else "all batches"
         return (f"{where}  shuffle={self.shuffle_partitions}  "
                 f"cache={self.cache}  join={self.join}  "
@@ -91,12 +72,8 @@ class Config:
 
 
 def session_for(cfg, app=None):
-    """A session configured by a Config.
-
-    The AQE settings are set here rather than in `gbif.spark_session` because
-    they are week-3's subject: day 12 turns skew handling off to show what it
-    was doing, and a setting you want to turn off has to be settable.
-    """
+    """Build a session from a Config. AQE is set here, not in
+    gbif.spark_session, so day12.py can turn it off and measure the difference."""
     spark = gbif.spark_session(app=app or f"gbif-{cfg.tag}",
                                driver_memory=cfg.driver_memory,
                                shuffle_partitions=cfg.shuffle_partitions)
@@ -107,15 +84,12 @@ def session_for(cfg, app=None):
     c.set("spark.sql.adaptive.enabled", str(cfg.aqe).lower())
     c.set("spark.sql.adaptive.skewJoin.enabled", str(cfg.aqe_skew_join).lower())
     if cfg.join == "sortmerge":
-        # -1 disables auto-broadcast entirely. This is how day 12 forces the
-        # comparison; it is not a setting any real job should carry.
+        # -1 turns auto-broadcast off. Only used to force the comparison.
         c.set("spark.sql.autoBroadcastJoinThreshold", "-1")
     return spark
 
 
 # --- the stages -------------------------------------------------------------
-# Each one takes what it needs and returns what the next one needs. No stage
-# reads a module-level variable, which is what makes them reusable.
 
 def stage_read(spark, cfg):
     facts = curate.read_table(spark, cfg.table, cfg.batches or None)
@@ -126,8 +100,7 @@ def stage_read(spark, cfg):
 DIM_COLUMNS = ["datasetkey", "publisher_key", "publisher_title",
                "publisher_country", "license"]
 
-# The job touches 18 of the curated table's 47 columns. Listed once, because
-# day 11 measures what the other 29 cost and needs the list to be honest.
+# The job uses 15 of the curated table's 47 columns.
 FACT_COLUMNS = ["gbifid", "datasetkey", "country", "decade", "year", "basis",
                 "species", "specieskey", "cell_id", "n_issues", "n_geo_issues",
                 "issues", "usable_for_mapping", "uncertainty_known",
@@ -135,11 +108,10 @@ FACT_COLUMNS = ["gbifid", "datasetkey", "country", "decade", "year", "basis",
 
 
 def stage_enrich(facts, dim, cfg):
-    """Left join the publisher dimension on, and project to what is used.
+    """Left join the publisher dimension and project to the columns used.
 
-    Left, never inner: an inner join silently deletes the rows with no
-    registered publisher, and those rows are part of the answer. Same rule as
-    `curate()` - never drop a row, make the filter a column.
+    Left, not inner: an inner join would drop rows with no registered
+    publisher, and those rows are part of the answer.
     """
     d = dim.select(*DIM_COLUMNS)
     if cfg.join == "broadcast":
@@ -156,12 +128,7 @@ def stage_enrich(facts, dim, cfg):
 
 
 def apply_cache(df, cfg):
-    """Persist the enriched table, if the config says to.
-
-    The storage level is a config field and not a constant because day 13's
-    whole finding is that the right answer depends on whether the data fits -
-    and at 90 GB on a 16 GB laptop, it does not.
-    """
+    """Persist the enriched table if the config asks for it."""
     from pyspark import StorageLevel
     levels = {"memory": StorageLevel.MEMORY_ONLY,
               "memory_and_disk": StorageLevel.MEMORY_AND_DISK,
@@ -174,11 +141,7 @@ def apply_cache(df, cfg):
 
 
 def join_strategy(df):
-    """Which join Spark actually chose, off the executed plan.
-
-    Day 4 learned this the hard way: the plan is the only witness. "It should
-    broadcast, it is tiny" was wrong for a 13-row table.
-    """
+    """Which join Spark actually chose, read off the executed plan."""
     plan = df._jdf.queryExecution().executedPlan().toString()
     return "BroadcastHashJoin" if "BroadcastHashJoin" in plan else "SortMergeJoin"
 
@@ -212,10 +175,10 @@ def stage_breakdowns(e, results, force=True):
     flags = F.avg("n_issues").alias("mean_flags")
     for name, keys in BREAKDOWNS:
         results[name] = e.groupBy(*keys).agg(n, usable, flags)
-    # A lazy DataFrame costs nothing, so without an action this stage's timing
-    # would be a lie. `force` is False only when the caller is going to write
-    # these immediately - then the write is the action and counting first would
-    # compute everything twice, which is exactly what day 10 caught.
+    # Without an action a lazy DataFrame costs nothing and the stage timing
+    # is meaningless. force=False means the caller writes these straight
+    # after, so the write is the action and counting first would double the
+    # work.
     if not force:
         return []
     return [results[name].count() for name, _ in BREAKDOWNS]
@@ -236,8 +199,7 @@ def stage_publisher_stats(e, results, force=True, cache_results=False):
                           F.row_number().over(w.orderBy(F.desc("records"))))
               .withColumn("flag_gap", F.col("mean_flags") - F.col("pub_mean_flags")))
     if cache_results:
-        # 1,433 rows, read again by stage 6 and stage 8. Small and expensive is
-        # the shape that caching is actually for.
+        # ~1.4k rows, read again by stages 6 and 8.
         ranked = ranked.persist()
     results["by_dataset"] = ranked
     results["by_publisher"] = (e.groupBy("publisher_key", "publisher_title",
@@ -250,8 +212,8 @@ def stage_publisher_stats(e, results, force=True, cache_results=False):
 
 
 def stage_variance(spark, results):
-    """The claim from SCOPE.md as one number: is flag mix a publisher
-    property? Between-publisher variance over total variance."""
+    """Between-publisher variance over total variance: how much of the
+    variation in flag counts is explained by who published the record."""
     w = Window.partitionBy("publisher_key")
     s = (results["by_dataset"].select("publisher_key", "mean_flags")
          .withColumn("pub_mean", F.avg("mean_flags").over(w))
@@ -278,7 +240,7 @@ def stage_flags(e, results, force=True):
 
 
 def write_one(df, name, cfg):
-    """Write one result table and return its size on disk."""
+    """Write one result table, return its size on disk."""
     path = pathlib.Path(cfg.out) / name
     path.parent.mkdir(parents=True, exist_ok=True)
     w = df.coalesce(1) if cfg.coalesce_output else df
@@ -294,11 +256,8 @@ def stage_write(results, cfg, skip=()):
 
 
 def stage_verify(spark, cfg, n_facts):
-    """Read one result back and check it adds up to the input row count.
-
-    Cheap, and it catches the failure mode that matters when you start moving
-    partitioning knobs: a tuning change that quietly loses rows.
-    """
+    """Read one result back and check it sums to the input row count. Cheap,
+    and it catches a tuning change that quietly loses rows."""
     back = spark.read.parquet(str(pathlib.Path(cfg.out) / "by_decade"))
     total = back.agg(F.sum("records")).collect()[0][0]
     return total, bool(total == n_facts)
@@ -306,7 +265,7 @@ def stage_verify(spark, cfg, n_facts):
 
 # --- the whole job ----------------------------------------------------------
 class Stages:
-    """One measurement per stage, printed as the day-9 report at the end."""
+    """Collects one measurement per stage and prints the report."""
 
     def __init__(self, spark, quiet=False):
         self.spark, self.rows, self.quiet = spark, [], quiet
@@ -369,11 +328,10 @@ def run(spark, cfg, quiet=False):
 
     e = st.run("2 enrich (join + cache)", _enrich)
 
-    # Day 10's finding, as code. By default every aggregate stage forces its
-    # results with a count() and stage 8 then computes them all over again to
-    # write them - 22 passes over the fact table for 11 result tables. With
-    # write_in_place, each stage writes what it just built, so the write is the
-    # action, nothing is forced twice, and the stage timings stay honest.
+    # Without write_in_place each aggregate stage forces its results with a
+    # count() and stage 8 recomputes them all to write them: 22 passes over
+    # the fact table for 11 result tables. With it, each stage writes what it
+    # built, so nothing is computed twice.
     sizes = {}
     force = not cfg.write_in_place
 
@@ -436,7 +394,7 @@ def print_answer(summary):
 
 
 def totals(rows):
-    """The three numbers that describe a run, summed over its stages."""
+    """Per-run totals, summed over the stages."""
     return {"seconds": sum(m["seconds"] for m in rows),
             "input_bytes": sum(m["input_bytes"] for m in rows),
             "shuffle_write_bytes": sum(m["shuffle_write_bytes"] for m in rows),

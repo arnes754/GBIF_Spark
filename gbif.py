@@ -1,13 +1,104 @@
+"""Java lookup, S3 shard listing and the Spark session builder."""
 import json
 import os
 import pathlib
+import shutil
+import subprocess
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-os.environ.setdefault(
-    "JAVA_HOME", "/usr/local/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home"
-)
+# PySpark 4.2 needs Java 17 or 21.
+SUPPORTED_JAVA = (17, 21)
+
+INSTALL_HINT = """Spark needs a Java 17 or 21 JDK and none was found.
+
+  macOS     brew install openjdk@17
+  Debian    sudo apt install openjdk-17-jdk
+  Fedora    sudo dnf install java-17-openjdk-devel
+
+Or point JAVA_HOME at one:
+
+  export JAVA_HOME=/path/to/jdk-17"""
+
+
+def _java_version(home):
+    """Major version of the JDK at `home`, or None if there is no java there."""
+    java = pathlib.Path(home) / "bin" / "java"
+    if not java.is_file():
+        return None
+    try:
+        out = subprocess.run([str(java), "-version"], capture_output=True,
+                             text=True, timeout=30).stderr
+    except (OSError, subprocess.SubprocessError):
+        return None
+    # 'openjdk version "17.0.20.1"' -> 17, '"1.8.0_392"' -> 8
+    for token in out.split('"'):
+        parts = token.split(".")
+        if parts and parts[0].isdigit():
+            major = int(parts[0])
+            return int(parts[1]) if major == 1 and len(parts) > 1 else major
+    return None
+
+
+def _candidate_java_homes():
+    """Places a JDK might be, best guess first."""
+    if os.environ.get("JAVA_HOME"):
+        yield pathlib.Path(os.environ["JAVA_HOME"])
+
+    # macOS keeps a registry of installed JDKs.
+    if pathlib.Path("/usr/libexec/java_home").exists():
+        for version in SUPPORTED_JAVA:
+            try:
+                out = subprocess.run(["/usr/libexec/java_home", "-v", str(version)],
+                                     capture_output=True, text=True, timeout=30)
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if out.returncode == 0 and out.stdout.strip():
+                yield pathlib.Path(out.stdout.strip())
+
+    # Homebrew JDKs are not in that registry. /usr/local is Intel,
+    # /opt/homebrew is Apple Silicon.
+    for brew in ("/usr/local/opt", "/opt/homebrew/opt"):
+        for version in SUPPORTED_JAVA:
+            yield pathlib.Path(brew) / f"openjdk@{version}" / "libexec" / \
+                "openjdk.jdk" / "Contents" / "Home"
+
+    for root in ("/usr/lib/jvm", "/usr/java",
+                 os.path.expanduser("~/.sdkman/candidates/java")):
+        directory = pathlib.Path(root)
+        if directory.is_dir():
+            yield from sorted(directory.iterdir())
+
+    # Fall back to whatever java is on PATH: bin/java -> home is two up.
+    found = shutil.which("java")
+    if found:
+        yield pathlib.Path(found).resolve().parent.parent
+
+
+def find_java_home():
+    """Path of a Java 17 or 21 JDK, or raise with install instructions."""
+    seen, wrong_version = set(), []
+    for home in _candidate_java_homes():
+        if home in seen:
+            continue
+        seen.add(home)
+        version = _java_version(home)
+        if version in SUPPORTED_JAVA:
+            return str(home)
+        if version is not None:
+            wrong_version.append((version, home))
+
+    message = INSTALL_HINT
+    if wrong_version:
+        found = ", ".join(f"Java {v} at {h}" for v, h in wrong_version[:3])
+        message += f"\n\nFound but unusable: {found}"
+    raise RuntimeError(message)
+
+
+# PySpark reads JAVA_HOME when it starts the JVM, so set it on import.
+# A JAVA_HOME that is already set is tried first and wins if it is valid.
+os.environ["JAVA_HOME"] = find_java_home()
 
 REGION = "eu-central-1"
 BUCKET = f"gbif-open-data-{REGION}"
@@ -19,6 +110,7 @@ _S3_NS = "{http://s3.amazonaws.com/doc/2006-03-01/}"
 
 
 def list_shards(refresh=False):
+    """(key, size) for every parquet shard in the snapshot. Cached to disk."""
     if _CACHE.exists() and not refresh:
         cached = json.loads(_CACHE.read_text())
         if cached.get("prefix") == PREFIX:
@@ -49,6 +141,8 @@ def snapshot_size_gb():
 
 
 def pick_slice(target_gb=10.0, spread=True, refresh=False):
+    """Pick shard paths up to target_gb. spread=True takes them evenly across
+    the snapshot instead of the first N, so the slice stays representative."""
     shards = list_shards(refresh=refresh)
     budget = target_gb * 1024**3
 
@@ -72,6 +166,7 @@ def pick_slice(target_gb=10.0, spread=True, refresh=False):
 
 
 def _hadoop_version():
+    """Match hadoop-aws to the hadoop-client jar PySpark ships with."""
     import pyspark
     jars = pathlib.Path(pyspark.__file__).parent / "jars"
     for jar in jars.glob("hadoop-client-api-*.jar"):
@@ -84,15 +179,10 @@ AWS_SDK_VERSION = "2.35.4"
 
 def spark_session(app="gbif", driver_memory="4g", shuffle_partitions=24,
                   max_task_failures=4, cores=None):
-    """Every script goes through here, so the two settings that decide how much
-    of the machine Spark takes are overridable from the environment without
-    editing any script:
+    """Build the session. SPARK_CORES and SPARK_MEM override cores and heap
+    from the environment, so a busy machine does not need a code change:
 
-        SPARK_CORES=4  uv run python day5.py     # 4 threads instead of all 12
-        SPARK_MEM=3g   uv run python day6.py     # smaller JVM heap
-
-    Defaults stay as the caller asked for, so nothing changes unless you set
-    them.
+        SPARK_CORES=4 SPARK_MEM=3g uv run python day5.py
     """
     from pyspark.sql import SparkSession
 
@@ -101,23 +191,10 @@ def spark_session(app="gbif", driver_memory="4g", shuffle_partitions=24,
 
     return (
         SparkSession.builder.appName(app)
-        # local[*] means maxFailures = 1: ONE task failure aborts the whole
-        # job, with no retry. A single transient DNS blip killed a 10 GB
-        # ingest two minutes in ("Task 9 in stage 2.0 failed 1 times;
-        # aborting job"). local[*, F] sets maxFailures to F, which is what
-        # every cluster mode gives you by default. Reading from S3 over a home
-        # connection, transient failures are not exceptional - they are the
-        # normal case, and the job has to survive them.
-        # local[C,F]: C worker threads, F attempts per task before the job
-        # aborts.
-        #
-        # C ("*" = every core) is how many tasks run AT ONCE, and therefore how
-        # many S3 connections are open at once. More is not always better: the
-        # link to eu-central-1 tops out around 4 MB/s no matter how many
-        # streams share it, so 12 readers get ~0.34 MB/s each and a multi-MB
-        # range request starts crossing the S3 client's 60 s timeout. Fewer,
-        # fatter readers finish inside the timeout. Parallelism past the
-        # bandwidth ceiling buys nothing and costs failures.
+        # local[C,F]: C worker threads, F attempts per task. Plain local[*]
+        # means F=1, so one transient S3 failure aborts the whole job.
+        # C also caps how many S3 connections are open at once; past the
+        # ~4 MB/s link ceiling more readers just means more timeouts.
         .master(f"local[{cores},{max_task_failures}]")
         .config("spark.driver.memory", driver_memory)
         .config(
@@ -131,38 +208,24 @@ def spark_session(app="gbif", driver_memory="4g", shuffle_partitions=24,
         )
         .config("spark.hadoop.fs.s3a.endpoint", f"s3.{REGION}.amazonaws.com")
         .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
-        # --- S3 resilience over a home connection -------------------------
-        # 318 ApiCallTimeoutExceptions and 65 UnknownHostExceptions killed two
-        # 10 GB ingests. The defaults assume datacentre bandwidth and a
-        # datacentre's DNS; neither holds here.
-        #
-        # The 60 s timeouts came from the "analytics accelerator" reader that
-        # hadoop-aws 3.5 enables by default. It issues many concurrent range
-        # requests, which is exactly wrong when the bottleneck is a shared
-        # 4 MB/s pipe - each request gets a sliver of bandwidth and crosses the
-        # deadline. Turning it off restores the classic S3A stream, whose
-        # timeouts these settings actually control.
+        # S3 over a home connection. hadoop-aws 3.5 defaults to the analytics
+        # accelerator reader, which issues many concurrent range requests and
+        # times out when they share one slow link. The classic S3A stream plus
+        # long timeouts and many retries is what survives here.
         .config("spark.hadoop.fs.s3a.analytics.accelerator.enabled", "false")
         .config("spark.hadoop.fs.s3a.connection.timeout", "5m")
         .config("spark.hadoop.fs.s3a.connection.request.timeout", "5m")
         .config("spark.hadoop.fs.s3a.connection.establish.timeout", "60s")
-        # retries: transient DNS and connection resets are the NORMAL case
-        # here, not the exception, so retry far more than the default and back
-        # off between attempts rather than hammering.
         .config("spark.hadoop.fs.s3a.attempts.maximum", "20")
         .config("spark.hadoop.fs.s3a.retry.limit", "20")
         .config("spark.hadoop.fs.s3a.retry.interval", "2s")
         .config("spark.hadoop.fs.s3a.retry.throttle.limit", "20")
-        # fewer, fatter readers: past the bandwidth ceiling extra concurrency
-        # buys nothing and costs timeouts
         .config("spark.hadoop.fs.s3a.connection.maximum", "32")
         .config("spark.sql.shuffle.partitions", shuffle_partitions)
         .config("spark.sql.parquet.filterPushdown", "true")
         .config("spark.sql.adaptive.enabled", "true")
-        # The console progress bar writes carriage returns to stdout, so any
-        # print() that lands mid-stage is overwritten and any grep over the
-        # captured log silently loses it. Measurements are the output of these
-        # scripts; they do not get to be eaten by a progress indicator.
+        # The progress bar overwrites stdout with carriage returns, which eats
+        # printed measurements and breaks grep over captured logs.
         .config("spark.ui.showConsoleProgress", "false")
         .getOrCreate()
     )
@@ -177,17 +240,6 @@ def snapshot_path():
 
 
 def read_snapshot(spark):
-    """The whole snapshot. Hand Spark the directory, not 9898 paths - it lists
-    and bin-packs the files itself, and the plan is built in one shot."""
+    """Whole snapshot. Pass the directory, not 9898 paths: Spark lists and
+    bin-packs the files itself and builds the plan in one go."""
     return spark.read.parquet(snapshot_path())
-
-
-def use_minio(spark, endpoint="http://localhost:9000",
-              key="minio", secret="minio12345"):
-    hc = spark.sparkContext._jsc.hadoopConfiguration()
-    hc.set("fs.s3a.endpoint", endpoint)
-    hc.set("fs.s3a.access.key", key)
-    hc.set("fs.s3a.secret.key", secret)
-    hc.set("fs.s3a.path.style.access", "true")
-    hc.set("fs.s3a.aws.credentials.provider",
-           "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider")

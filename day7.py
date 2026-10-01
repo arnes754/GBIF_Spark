@@ -1,7 +1,7 @@
 """Day 7 - joins: a 58-million-row fact table meets a 54-thousand-row dimension.
 
 The whole reason this join exists: the occurrence snapshot knows `datasetkey`
-and nothing about who published it. SCOPE.md's claim is that flags describe the
+and nothing about who published it. The claim under test is that flags describe the
 PUBLISHER, not the record. Without registry.py's dimension table there is no
 publisher column and no claim to test.
 
@@ -31,7 +31,7 @@ HOLD_FOR_UI = os.environ.get("HOLD_FOR_UI") == "1"
 # on part of it; day 6 proved that an oversized JVM heap plus anything else
 # ends in the OS killing processes rather than in a Spark error. The curated
 # table is 2.3 GB with column pruning on top, so 4 GB is not the constraint -
-# see logs/gotchas.md.
+# see the note in day6.py.
 spark = gbif.spark_session(app="gbif-day7", driver_memory="4g",
                            shuffle_partitions=24)
 spark.sparkContext.setLogLevel("ERROR")
@@ -131,7 +131,7 @@ print(f"  inner join on specieskey: {inner:,}   ({FACT_ROWS - inner:,} rows gone
 print(f"  left join on specieskey : {left:,}")
 print(f"""
   An inner join is a filter you did not write. {100 * (FACT_ROWS - inner) / FACT_ROWS:.0f}% of the table
-  disappeared and nothing warned you. For SCOPE.md this matters more than
+  disappeared and nothing warned you. For this project that matters more than
   usual: the question is what fraction of GBIF is unusable, and unusable
   records are exactly the ones with null keys. An inner join here would delete
   the evidence and then report that the data is clean.
@@ -183,7 +183,7 @@ for r in top:
           f"{r['records']:>13,}{100 * (r['usable'] or 0):>8.1f}%"
           f"{r['mean_flags'] or 0:>8.2f}")
 print("""
-  This table IS the claim in SCOPE.md section 1, in its rawest form: if the
+  This table is the claim in its rawest form: if the
   usable-share column were roughly constant, the claim would be dead. It is
   not constant. Day 8 turns that observation into within-vs-between variance,
   which is the version that can be defended.""")
@@ -256,7 +256,7 @@ if DO_SKEW:
   split, or when you need the salt for something else too. Here it costs an
   extra shuffle to build the {SALT}x dimension and is not worth it.
 
-  And the honest answer for THIS join: none of it matters, because the
+  For this particular join none of it matters, because the
   dimension is {gb(DIM_BYTES)} and broadcasting removes the shuffle entirely. Skew is
   a shuffle problem. No shuffle, no skew.""")
 

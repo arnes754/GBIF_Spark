@@ -1,9 +1,8 @@
-"""The dataset registry: GBIF's dimension table, fetched once and cached.
+"""Build the publisher dimension from the GBIF registry API.
 
-The occurrence snapshot knows `datasetkey` and `publishingorgkey` and nothing
-else. Who published a record, from which country, under what licence, lives in
-the GBIF registry API. SCOPE.md's claim is about publishers, so without this
-join there is no claim to test.
+The occurrence snapshot carries datasetkey and publishingorgkey and nothing
+else; who published a record, from where and under what licence comes from the
+registry.
 
     uv run python registry.py keys       # distinct datasetkeys in the table
     uv run python registry.py fetch      # /dataset/{key} + /organization/{key}
@@ -11,24 +10,12 @@ join there is no claim to test.
     uv run python registry.py status
     uv run python registry.py show
 
-Why key-directed fetch and not pagination - this cost an afternoon:
-
-  The obvious approach is to page /dataset/search?type=OCCURRENCE, 54 pages of
-  1000. The first pages return in ~1 s. By offset 30,000 a single page had not
-  returned after two minutes. The endpoint is Elasticsearch-backed and deep
-  pagination makes the engine sort and discard `offset` documents on every
-  shard for every request, so cost grows with offset, not with page size. Deep
-  paging a search API is a known anti-pattern; a search_after cursor is the
-  supported way, and GBIF does not expose one here.
-
-  The fix is to stop asking for data we do not need. The occurrence slice
-  references ~1,500 distinct datasets, not 54,000. Fetching /dataset/{key} for
-  exactly those keys is ~0.25 s each, embarrassingly parallel, cacheable,
-  incremental, and has no offset in it at all. It is also the shape that scales:
-  at 266 GB the key list grows, the method does not change.
-
-  This is the dimension-table lesson in general - build the dimension for the
-  keys the fact table actually has.
+Fetched per key rather than by paging /dataset/search. That endpoint is
+Elasticsearch-backed and deep pagination stalls past offset ~30,000, because
+the engine sorts and discards `offset` documents per shard per request. The
+table only references ~1,500 datasets out of 54,000, so fetching exactly those
+keys is faster, incremental, and scales with the fact table instead of with
+GBIF.
 """
 import argparse
 import concurrent.futures
@@ -212,12 +199,11 @@ def cmd_fetch(args):
 
 
 def dimension(spark):
-    """jsonl -> DataFrame. Separate from the write so day 7 can call it.
+    """jsonl caches -> DataFrame.
 
-    The two caches are joined IN PYTHON, not in Spark: they are thousands of
-    rows, the driver already holds them, and starting a shuffle to join two
-    dicts would be the kind of thing this project is supposed to teach you not
-    to do.
+    The two caches are joined in Python, not in Spark: they are a few thousand
+    rows the driver already holds, and a shuffle to join two dicts is not worth
+    paying for.
     """
     ds = _read_jsonl(DATASETS)
     orgs = {r["publisher_key"]: r for r in _read_jsonl(ORGS)}
@@ -237,14 +223,11 @@ def dimension(spark):
         ))
 
     d = spark.createDataFrame(rows, SCHEMA)
-    # Licence URLs are unreadable in a groupBy. Two families exist and only
-    # one of them says "licenses":
-    #   .../licenses/by/4.0/legalcode      -> CC_BY_4_0
+    # Licence URLs come in two families and only one says "licenses":
+    #   .../licenses/by/4.0/legalcode       -> CC_BY_4_0
     #   .../publicdomain/zero/1.0/legalcode -> CC0_1_0
-    # A regex written for the first family silently bucketed every CC0 dataset
-    # (42% of them) into a group called LEGALCODE, because the fallback took
-    # the last path segment. The wrong answer looked like a real category,
-    # which is the dangerous kind of wrong.
+    # Handling only the first and falling back to the last path segment puts
+    # every CC0 dataset in a bucket called LEGALCODE.
     lic = F.regexp_extract("license_url", r"licenses/([^/]+)/([^/]+)", 0)
     pdm = F.regexp_extract("license_url", r"publicdomain/(zero|mark)/([^/]+)", 0)
     d = d.withColumn(
@@ -272,10 +255,8 @@ def cmd_build(args):
     spark.sparkContext.setLogLevel("ERROR")
     d = dimension(spark)
     n = d.count()
-    # one file on purpose: ~1 MB. Splitting it only makes Spark open more
-    # handles, and a single small file keeps the parquet footer's size
-    # statistic well under autoBroadcastJoinThreshold - which is what makes
-    # day 7's broadcast happen without a hint.
+    # One file on purpose (~1 MB): it keeps the parquet size statistic well
+    # under autoBroadcastJoinThreshold, so Spark broadcasts it without a hint.
     d.coalesce(1).write.mode("overwrite").option("compression", "snappy") \
      .parquet(args.out)
     size = sum(f.stat().st_size for f in pathlib.Path(args.out).rglob("*.parquet"))

@@ -1,40 +1,27 @@
-"""Week 3, day 3 (day 12) - broadcast joins, and skew.
+"""Broadcast joins and data skew.
 
-Two things that are always taught together and are actually one thing: both are
-about a shuffle, and both stop mattering if you can avoid the shuffle.
+A join has to get rows with the same key onto the same machine. SortMergeJoin
+shuffles both sides and sorts; BroadcastHashJoin sends the small side whole to
+every task and never moves the big side. Spark picks broadcast when it
+estimates one side is under spark.sql.autoBroadcastJoinThreshold (10 MB), and
+that estimate comes from a statistic, not from the real size.
 
-A join has to get rows with the same key onto the same machine. There are two
-ways:
-
-  SortMergeJoin   shuffle BOTH sides by the key, sort each partition, merge.
-                  Works at any size. Costs writing and re-reading both sides.
-  BroadcastHashJoin  send the small side, whole, to every task, and stream the
-                  big side past it. No shuffle of the big side at all. Only
-                  possible if the small side fits in each task's memory.
-
-Spark picks broadcast by itself when it believes one side is under
-`spark.sql.autoBroadcastJoinThreshold` (10 MB by default). "Believes" is the
-load-bearing word, and day 4 of this project got burned by it: a 13-row lookup
-got a SortMergeJoin, because the lookup was RDD-backed and had no size
-*statistic*. The data was tiny; Spark did not know it was tiny.
-
-SKEW is the other half. A shuffle sends each key to a partition chosen by its
-hash. If one key has 40% of the rows, one partition gets 40% of the rows, and
-one task does 40% of the work while the other eleven finish and wait. Nothing
-is broken, every total is correct, and the job takes as long as its slowest
-task. GBIF has this: a handful of datasetkeys are enormous.
+Skew is the other half: a shuffle assigns keys to partitions by hash, so one
+very common key puts a disproportionate share of the rows in one task. Totals
+stay correct and the job runs as slow as its slowest task.
 
     uv run python day12.py
     uv run python day12.py --batches b0000,b0003
+    uv run python day12.py --only 3
 
-Experiments:
-  1  does Spark broadcast the dimension on its own, and how does it decide
-  2  broadcast vs sort-merge, measured on the job's actual join
-  3  how skewed is datasetkey, really
+  1  does Spark broadcast the dimension on its own
+  2  broadcast vs sort-merge on the job's actual join
+  3  how skewed datasetkey is
   4  a skewed sort-merge join, with AQE skew handling on and off
-  5  salting the hot keys by hand, measured against AQE
+  5  hand-salting, measured against AQE
 """
 import argparse
+import pathlib
 
 from pyspark.sql import functions as F
 
@@ -49,11 +36,8 @@ SALT = 16
 
 
 def size_stat(df):
-    """What Spark's optimizer BELIEVES this DataFrame weighs.
-
-    Not what it weighs. This is the number the broadcast decision is made on,
-    and the gap between it and reality is where day 4's bug lived.
-    """
+    """The optimizer's size estimate for this DataFrame, which is what the
+    broadcast decision is made on - not the real size."""
     return int(df._jdf.queryExecution().optimizedPlan().stats().sizeInBytes())
 
 
@@ -73,8 +57,7 @@ def exp_does_it_broadcast(spark, cfg):
     dim = spark.read.parquet(cfg.dim).select(*job.DIM_COLUMNS)
 
     threshold = bench.conf_bytes(spark, "spark.sql.autoBroadcastJoinThreshold")
-    dim_disk = sum(f.stat().st_size for f in
-                   __import__("pathlib").Path(cfg.dim).rglob("*.parquet"))
+    dim_disk = dimension_bytes(cfg)
     print(f"  autoBroadcastJoinThreshold   {gb(threshold)}")
     print(f"  dimension on disk            {gb(dim_disk)}  ({dim.count():,} rows)")
     print(f"  dimension sizeInBytes stat   {gb(size_stat(dim))}")
@@ -90,17 +73,15 @@ def exp_does_it_broadcast(spark, cfg):
     spark.conf.set("spark.sql.autoBroadcastJoinThreshold", str(threshold))
 
     print(f"""
-  The statistic is the whole mechanism. A parquet-backed relation has one -
-  Spark reads the file sizes without opening a single row group - so it knows
-  the dimension is {gb(size_stat(dim))} and broadcasts it unprompted. Day 4's lookup was
-  built with createDataFrame on an RDD, which has no statistic, so Spark fell
-  back to "assume it is enormous" and shuffled 13 rows.
+  The size statistic is the mechanism. A parquet relation has one - Spark
+  reads the file footers without opening a row group - so it knows the
+  dimension is {gb(size_stat(dim))} and broadcasts it. An RDD-backed DataFrame has no
+  statistic, so Spark assumes it is large and shuffles it even when it holds
+  a handful of rows.
 
-  Which is why the fix for a missing broadcast is usually not F.broadcast().
-  It is "write the small side to parquet so Spark can see how small it is".
-  F.broadcast() is a hint that overrides the estimate; useful when you know
-  better than the statistic, and a liability when you do not - broadcasting
-  something that turns out to be 2 GB kills the driver.
+  So the fix for a missing broadcast is usually to write the small side to
+  parquet, not to add F.broadcast(). The hint overrides the estimate, which
+  also means it can be wrong once the data grows.
 """)
     return {"threshold": threshold, "dim_stat": size_stat(dim),
             "auto_strategy": strategy(auto)}
@@ -140,19 +121,19 @@ def exp_broadcast_vs_sortmerge(spark, cfg):
     ])
     b, s = rows[0], rows[1]
     print(f"""
-  The shuffle column is the finding, not the seconds. Sort-merge shuffles
-  {gb(s['shuffle_write_bytes'])} where broadcast shuffles {gb(b['shuffle_write_bytes'])}: the whole fact table has to
-  cross a stage boundary so that rows with equal datasetkey land together.
-  Broadcast sends {gb(cfg_dim_bytes(cfg))} to every task instead and the fact table never moves.
+  Read the shuffle column rather than the seconds. Sort-merge shuffles
+  {gb(s['shuffle_write_bytes'])} against broadcast's {gb(b['shuffle_write_bytes'])}: the whole fact table crosses a
+  stage boundary so rows with equal datasetkey land together. Broadcast
+  sends {gb(dimension_bytes(cfg))} to every task and the fact table never moves.
 
-  That ratio is also why skew disappears in experiment 4 when the join is a
-  broadcast. Skew is a property of the shuffle. No shuffle, no skew.
+  Skew is a property of the shuffle, so no shuffle means no skew.
 """)
     return rows
 
 
-def cfg_dim_bytes(cfg):
-    import pathlib
+def dimension_bytes(cfg):
+    """How big the publisher dimension is on disk - the number that decides
+    whether Spark will broadcast it."""
     return sum(f.stat().st_size for f in pathlib.Path(cfg.dim).rglob("*.parquet"))
 
 
@@ -179,11 +160,10 @@ def exp_how_skewed(spark, cfg):
     print(f"  mean rows per key {mean:,.0f}, biggest key {top[0]['count']:,} "
           f"({top[0]['count'] / mean:,.0f}x the mean)")
     print(f"""
-  What this means for a SHUFFLE on datasetkey: partitions are assigned by
-  hash(key) % n. The biggest key cannot be split across partitions, so one
-  partition is at least {top[0]['count']:,} rows no matter how many partitions you ask
-  for. Raising shuffle.partitions does nothing for this - that is the single
-  most common wrong fix.
+  For a shuffle on datasetkey, partitions are assigned by hash(key) % n. The
+  biggest key cannot be split across partitions, so one partition holds at
+  least {top[0]['count']:,} rows however many partitions are requested. Raising
+  shuffle.partitions does not help.
 """)
     per_key.unpersist()
     return {"keys": n_keys, "rows": total, "top10_share": top10 / total,
@@ -205,11 +185,9 @@ def skewed_join(spark, cfg):
 
 def exp_aqe_skew(spark, cfg):
     banner("4. a skewed sort-merge join, with and without AQE skew handling")
-    print("""  AQE's skew join works at runtime: after the shuffle it can SEE how
-  big each partition came out, and it splits the oversized ones into several
-  tasks, replicating the matching rows from the other side. A static optimiser
-  cannot do this, because the sizes are not known until the shuffle has run.
-""")
+    print("  AQE's skew join runs after the shuffle, when the real partition\n"
+          "  sizes are known, and splits oversized partitions across several\n"
+          "  tasks. A static optimiser cannot do this.\n")
     threshold = bench.conf_bytes(spark, "spark.sql.autoBroadcastJoinThreshold")
     spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")   # force shuffle
 
@@ -238,12 +216,9 @@ def exp_aqe_skew(spark, cfg):
         ("tasks", "tasks", bench.NUM),
         ("worst task / median", "worst", lambda v: f"{v:.1f}x"),
     ])
-    print("""
-  The column to read is the last one. Wall time can be flat - on local[*] with
-  12 threads and a warm page cache, one slow task is often absorbed. The task
-  distribution is where skew is visible before it becomes a problem, and it is
-  what will blow up first when this runs on a real cluster with 100 GB.
-""")
+    print("\n  The last column is the one to read. Wall time can stay flat on\n"
+          "  local[*] with a warm page cache, because one slow task gets\n"
+          "  absorbed. The task distribution shows the skew first.\n")
     return rows
 
 
@@ -262,13 +237,12 @@ def worst_task(spark, m):
 # --- 5 ----------------------------------------------------------------------
 def exp_salting(spark, cfg):
     banner("5. salting the hot key by hand")
-    print(f"""  The manual version of what AQE does. Add a random salt 0..{SALT - 1} to the
-  big side's key, and explode the small side {SALT} times so every salt value has a
-  copy to match. The hot key is now spread over {SALT} partitions instead of one.
+    print(f"""  The manual version of what AQE does: add a random salt 0..{SALT - 1} to
+  the big side's key and explode the small side {SALT} times so every salt value
+  has a copy to match. The hot key spreads over {SALT} partitions.
 
-  The cost is explicit: the small side gets {SALT}x bigger, and building it is an
-  extra shuffle. You also have to KNOW which key is hot, in advance, which in
-  practice means re-measuring every time the data changes.
+  The costs: the small side is {SALT}x bigger, building it is an extra shuffle,
+  and you have to know in advance which key is hot.
 """)
     threshold = bench.conf_bytes(spark, "spark.sql.autoBroadcastJoinThreshold")
     spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
@@ -310,11 +284,9 @@ def exp_salting(spark, cfg):
         ("worst task / median", "worst", lambda v: f"{v:.1f}x"),
     ])
     print("""
-  Salting works, and it is more code, more shuffle bytes, and one more thing
-  that goes stale. AQE needs no code and cannot be wrong about which key is
-  hot, because it looks. Salting earns its place when AQE cannot help - a
-  skewed groupBy rather than a skewed join, for instance, which AQE will not
-  split.
+  Salting works, at the cost of more code, more shuffle bytes and a hot-key
+  list that goes stale. AQE needs no code and measures the sizes itself.
+  Salting is worth it where AQE does not help, such as a skewed groupBy.
 """)
     return rows
 
@@ -345,28 +317,20 @@ def main():
     if "5" in chosen:
         exp_salting(spark, cfg)
 
-    banner("what day 12 changes about the job")
-    print("""  Nothing, and that is the result.
+    banner("conclusions")
+    print("""  No change to the job.
 
-  The job's only join is fact x dimension on datasetkey. The dimension is
-  0.2 MB of parquet, Spark has a real statistic for it, and it broadcasts it
-  without being asked. So:
+  Its only join is fact x dimension on datasetkey. The dimension is 0.2 MB of
+  parquet, Spark has a real size statistic for it and broadcasts it without
+  being asked, so there is no shuffle on the join and therefore no skew on it
+  however skewed the column is.
 
-    - there is no shuffle on the join, so there is no skew on the join,
-      however skewed datasetkey is. Experiment 3 measures real skew in the
-      column and experiment 2 shows the join does not care.
-    - F.broadcast() stays OUT of job.py's default path. It is kept behind
-      --join broadcast purely so the comparison can be re-run. Hinting what
-      the optimiser already gets right is how you end up with a hint that is
-      wrong after the data grows.
-    - AQE's skew handling stays on. It costs nothing when there is no skew,
-      and the day the dimension grows past 10 MB it is the thing that saves
-      the job.
+  F.broadcast() stays out of the default path and is kept behind
+  --join broadcast so the comparison can be re-run. AQE skew handling stays
+  on: it costs nothing when there is no skew and matters if the dimension
+  ever grows past the broadcast threshold.
 
-  The transferable version: before tuning a join, check whether it is a
-  shuffle at all. Most "my join is slow" is a join that should have been a
-  broadcast and is not, and the usual cause is a missing statistic - not a
-  missing hint.""")
+  Before tuning a join, check whether it is a shuffle at all.""")
     spark.stop()
     print("\ndone.")
 

@@ -2,9 +2,9 @@
 
 Days 5-8 each answered one question in isolation. This is the job: read the
 curated table, enrich it with the registry dimension, compute every aggregate
-SCOPE.md needs, write the results, read them back to prove they are right.
+the analysis needs, write the results, read them back to check them.
 
-The rule from SCOPE.md section 4: full data in, small aggregates out. The
+The rule is full data in, small aggregates out. The
 inputs are gigabytes, the outputs are kilobytes, and nothing downstream ever
 reads the fact table again.
 
@@ -24,6 +24,7 @@ itself is `job.run()`. Nothing about what it computes changed.
 import argparse
 import datetime
 import json
+import os
 import pathlib
 import platform
 import time
@@ -57,7 +58,7 @@ def main():
                    help="spark.sql.files.maxPartitionBytes (day 11)")
     p.add_argument("--cache", default="none", choices=job.CACHE_MODES,
                    help="how to persist the enriched table. Default changed "
-                        "from memory_and_disk to none on day 13 - see WEEK3.md")
+                        "from memory_and_disk to none - see day13.py")
     p.add_argument("--join", default="auto", choices=job.JOIN_MODES,
                    help="let Spark choose, force broadcast, or forbid it (day 12)")
     p.add_argument("--no-aqe", action="store_true", help="turn AQE off (day 12)")
@@ -108,7 +109,7 @@ def main():
     print(f"  input     : {gb(in_bytes)} on disk")
     print(f"  out       : {cfg.out}")
     print(f"  host      : {platform.machine()} / "
-          f"{__import__('os').cpu_count()} cores, driver {cfg.driver_memory}")
+          f"{os.cpu_count()} cores, driver {cfg.driver_memory}")
 
     spark = job.session_for(cfg, app=f"gbif-e2e-{cfg.tag}")
     st, _results, summary = job.run(spark, cfg)

@@ -93,7 +93,7 @@ print(f"""
   read takes one file's schema and assumes the rest match.
 
   At {N_FILES} files the difference is not measurable ({t_merged / max(t_plain, 1e-9):.1f}x) - so the
-  honest statement is NOT "mergeSchema is slow". It is: the cost scales with
+  statement is not "mergeSchema is slow", it is that the cost scales with
   FILE COUNT, and this table has {N_FILES} files. The snapshot has 9,898, and
   section 5's partitionBy-without-repartition layout produces 1,152 from a
   single decade. That is when it shows up, and it shows up at PLAN time,
@@ -170,7 +170,7 @@ print(f"""
   measuring column pruning by watching a byte counter will conclude it does
   not work. It works; the counter is answering a different question.
 
-  For SCOPE.md day 11's 266 GB estimate this matters directly: the extrapolation
+  For extrapolating to the full 266 GB snapshot this matters directly: the
   has to be built from file sizes and column WIDTH, because the run itself will
   not report the number.""")
 
@@ -249,7 +249,7 @@ print(f"""
 
   The sorted column skips the most, which is the mechanism working - but the
   effect is {100 * (1 - srt['scan_rows'] / base_rows):.0f}%, not the order of magnitude the idea promises. Two
-  honest reasons:
+  reasons:
 
     - curate.py sorts WITHIN each decade partition. The ordering is local, so
       every file's datasetkey range still overlaps every other file's.
@@ -391,7 +391,7 @@ gotchas hit
 questions
   - is 2M maxRecordsPerFile right? section 5 says file COUNT drives planning
     cost, so bigger files are better until a single task gets too big
-  - would partitioning by country instead of decade serve SCOPE.md better?
+  - would partitioning by country instead of decade serve the queries better?
     Every question groups by time, but the skew section of day 8 will say
     whether country is even usable as a partition key
 
