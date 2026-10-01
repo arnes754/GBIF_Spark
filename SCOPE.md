@@ -116,6 +116,23 @@ for the slice.
 
 ## 4. Week 2 — scale and the cluster (days 10-14)
 
+> **Changed after day 9 — see [WEEK3.md](WEEK3.md).** Days 10-14 became an
+> optimisation week instead: read the Spark UI (10), partitioning (11),
+> broadcast joins and skew (12), caching (13), before and after (14). The
+> reason is in this section's own first line - "the same job, on the full
+> 266 GB, on a real cluster, **with numbers explaining what mattered**". The
+> numbers came first, and they said the job did not survive its own caching
+> at 1 GB, let alone 266 GB. Taking a job that OOMs on a laptop and giving it
+> to a cluster of smaller workers would have measured nothing.
+>
+> What that week answered anyway: day 11's scale ladder (run at three sizes
+> and record everything) is day 14's matrix, and day 13's "tune with evidence,
+> one thing at a time, keep a before/after table" is literally the deliverable.
+> What is still owed: `spark-submit` to the docker cluster, driver-vs-executor
+> in a real distributed setting, and the full-snapshot run.
+
+
+
 Goal: the same job, on the full 266 GB, on a real cluster, with numbers
 explaining what mattered.
 
