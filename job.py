@@ -44,8 +44,9 @@ JOIN_MODES = ("auto", "broadcast", "sortmerge")
 class Config:
     """Everything a run is allowed to differ by.
 
-    Defaults are day 9's behaviour exactly, so `Config()` reproduces the
-    baseline and every week-3 experiment is one named field away from it.
+    Defaults are what week 3 concluded, not what day 9 shipped - the two
+    differ in `cache`, and `day14.py` keeps day 9's value as a named
+    configuration so the before/after stays reproducible.
     """
     # --- what to read -------------------------------------------------------
     table: str = DEFAULT_TABLE
@@ -56,7 +57,9 @@ class Config:
     # --- the knobs week 3 turns --------------------------------------------
     shuffle_partitions: int = 48
     max_partition_bytes: int = DEFAULT_MAX_PARTITION_BYTES
-    cache: str = "memory_and_disk"      # see CACHE_MODES
+    # Day 13's conclusion. Was "memory_and_disk" through day 9; persisting the
+    # fact table OOMs the driver above ~20 MB and saves nothing when it fits.
+    cache: str = "none"                 # see CACHE_MODES
     # Day 10 found the job computes every aggregate TWICE: once in its own
     # stage to force the timing, once again in the write stage. With this on,
     # each aggregate stage writes its own results, so the write IS the forcing

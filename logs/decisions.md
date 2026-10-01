@@ -65,3 +65,60 @@ because Z" is the backbone of the talk's middle section.
 - **UDF benchmark runs over 500k rows on 4 partitions, not 6.4M on 12.** The
   point of the section is the ratio between three implementations, and the
   ratio is visible at any size. The full-size version crashed the driver.
+
+- **The job extracted into `job.py`; day 9 kept as its CLI.** Rejected copying
+  the pipeline into each week-3 script. Five scripts have to run the same nine
+  stages with one setting moved, and five copies of a pipeline diverge by day
+  three. The stage functions read no globals, so a run is fully described by
+  its `Config` — which is what lets day 14 print the difference between two
+  runs as a table instead of as prose.
+
+- **No fact-table cache (`--cache none` is the default).** Rejected day 9's
+  `MEMORY_AND_DISK` on the enriched table. It was added because seven stages
+  read that table, which is the right question and the wrong answer: the thing
+  being cached is a parquet scan plus a broadcast join — cheap to recompute,
+  expensive to store, and impossible to column-prune once cached. It also
+  OOM'd the driver on every slice above 20 MB. Kept as a flag, not a default.
+
+- **Cache the small expensive intermediate instead.** `by_dataset` is ~1,400
+  rows produced by a groupBy over the whole fact table, and three stages read
+  it. That is the shape caching is actually for: small, and expensive to
+  produce. The fact table is the opposite shape on both counts.
+
+- **Each aggregate stage writes its own results (`--write-in-place`).**
+  Rejected keeping the single write stage at the end. Forcing an aggregate
+  with `count()` to time it and then writing the same lazy DataFrame computes
+  it twice; on a 1.1 GB slice the job read 22.98 GB. Letting the write be the
+  forcing action keeps the per-stage timings honest *and* computes each
+  aggregate once.
+
+- **Shuffle partitions left at 48.** Measured 12 / 48 / 200 / 800, with AQE on
+  and off. The job's shuffles are kilobytes — every aggregate reduces hard on
+  the map side — so the setting is choosing between 48 and 800 near-empty
+  tasks, and AQE coalesces them away regardless. Rejected "tune it anyway":
+  a number in a config file that no measurement supports is worse than the
+  default, because the next person has to assume it was deliberate.
+
+- **Input partitioning left at the 128 MB default.** The curated table's files
+  are already close to that size, so the default gives roughly one task per
+  file and saturates twelve cores. Nothing to win.
+
+- **`F.broadcast()` stays out of the default join path.** Spark already
+  broadcasts the 0.2 MB parquet dimension on its own, because parquet relations
+  carry a real size statistic. Rejected hinting it anyway: a hint that is
+  currently redundant is a hint that will be wrong after the dimension grows,
+  and nobody will remember to check.
+
+- **AQE skew handling stays on, and nothing else is done about skew.**
+  `datasetkey` is genuinely skewed, but the job's only join is a broadcast, so
+  there is no shuffle on it and therefore no skew to handle. Salting was
+  implemented and measured on a forced sort-merge join purely as the
+  comparison; it is not in the job.
+
+- **Day 14 runs three configurations, not two.** "We changed several things
+  and it got faster" is not a measurement. `nocache` sits between `before` and
+  `after` so the table attributes the difference to a specific change.
+
+- **Each day-14 run is a fresh JVM subprocess.** Rejected looping inside one
+  session. A session carries cached blocks, a warm JIT and conf values set by
+  the previous experiment, so a loop measures the order you ran things in.

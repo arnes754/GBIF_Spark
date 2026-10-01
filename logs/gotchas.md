@@ -273,3 +273,128 @@ stopping before the day-12 full run.
 the UDFs over 1M rows rather than 6.4M. Sizing the driver has to leave room for
 the python workers, and that is a sentence I had read many times without it
 meaning anything.
+
+## day 10 — every number in the table was zero, and nothing was broken
+**What I saw:** `day9.py` on a 5.7 GB slice printed a clean stage table where
+every measured column was `0 B` / `0 files` / `0 tasks`. The job itself was
+clearly doing work — the fans were going, the row counts at the end were
+right — but the harness that has been correct since day 5 reported nothing.
+
+**What I assumed:** that the asynchronous-listener bug from day 9 was back and
+`bench._settle()` had stopped waiting long enough. I spent twenty minutes
+raising its timeout.
+
+**What it actually was:** a second Spark session. An earlier background run had
+never exited, it was holding port 4040, and the new driver quietly took 4041.
+`bench.py` had `UI = "http://localhost:4040/api/v1"` hardcoded since day 5.
+Every REST call went to the *other* application's UI, asked it for an
+application id it had never heard of, got a 404, and the `except Exception:
+return []` in `_sql()` turned that into an empty list. No error, no warning,
+just zeroes.
+
+**How I found out:** `lsof -nP -iTCP:4040,4041 -sTCP:LISTEN` showed two java
+processes. Then `curl localhost:4040/api/v1/applications` returned an app
+named `gbif-e2e-probe-b0004-nocache` — a run I thought had finished half an
+hour earlier.
+
+**What I'd check first next time:** when a measurement reads zero rather than
+wrong, suspect the connection before the measurement. And a bare
+`except Exception: return []` around a network call is a decision to report
+"nothing happened" when the truth is "I could not find out" — those are not
+the same answer and the code should not conflate them.
+
+**What changed:** `bench.ui_base(spark)` asks `sparkContext.uiWebUrl` for the
+session's own UI. The port is now whatever Spark actually chose.
+
+## day 10 — the slowest stage was the one that is supposed to do nothing
+**What I saw:** the profile put "8 write aggregates" at 41% of wall time. Stage
+8 writes eleven result tables whose combined size is about 300 KB.
+
+**What I assumed:** small-file overhead, or `coalesce(1)` serialising the
+writes. Both plausible, both wrong.
+
+**What it actually was:** a DataFrame is a recipe, not a table, and I had
+written the job as if it were a table. Stages 3-7 build the eleven result
+DataFrames and call `.count()` on each one so the stage timings are honest.
+Stage 8 then calls `.write` on the same DataFrames — which re-runs every
+recipe from the parquet files. Every aggregate was computed exactly twice.
+On the 1.1 GB slice: 22.98 GB read for 1.04 GB of input, i.e. 22 passes over
+the fact table to produce eleven outputs.
+
+**How I found out:** the per-stage `read` column. Stage 4 read 5.22 GB, which
+is exactly five times the slice — five `groupBy`s, five scans. Stage 8 read
+11.49 GB, which is exactly eleven times the slice. Once the numbers are
+integer multiples of the input size, there is only one thing they can mean.
+
+**What I'd check first next time:** divide bytes-read by input size. If it is
+not close to 1, something is being recomputed, and the plan will tell you
+what. This is invisible in wall time and obvious in bytes.
+
+**What changed:** `Config.write_in_place` — each aggregate stage writes what it
+just built, so the write is the forcing action and nothing runs twice. Bytes
+read on the same slice went from 22.98 GB to 13.58 GB.
+
+## day 13 — the cache I added to make it faster is what stopped it running
+**What I saw:** `day9.py --batches b0004` (5.7 GB, 141M rows) died in stage 2.
+Then `--batches b0000` (1.1 GB, 26M rows) died in stage 2. Only the 20 MB toy
+batch completed — which is the only size I had ever run it at.
+
+    Caused by: java.lang.RuntimeException: java.lang.OutOfMemoryError: Java heap space
+      ... job.py apply_cache -> df.count()
+
+**What I assumed:** that `MEMORY_AND_DISK` could not OOM by definition. That is
+what the "and disk" is for: partitions that do not fit go to disk instead.
+
+**What it actually was:** the storage level decides where a *finished* block is
+put. It does not decide where the block is *built*. Each task unrolls its
+partition into Spark's columnar cache format in the JVM heap first, and with
+twelve tasks unrolling ~1M rows x 18 columns each — including an
+`array<string>` — into the same 4 GB heap that the query is already using, the
+unrolling is what runs out, before any storage level gets consulted.
+
+**How I found out:** the stack trace named `apply_cache`, which was the one
+function in the job that exists purely to make it faster. Removing it made
+every slice run.
+
+**What I'd check first next time:** `cache()` does not degrade, it cliffs. A
+job without it gets slower as data grows; a job with it works until it
+suddenly does not, at a size nobody wrote down. If a stage that was added for
+performance is the stage that fails, delete it first and measure second.
+
+**What changed:** the default is `--cache none`. The level is still a config
+field so the comparison stays re-runnable on a machine with more memory.
+
+## day 14 — the run after the crash is the one that lies
+**What I saw:** the before/after matrix ran nine configurations. The ones meant
+to OOM OOM'd, as designed. But the run immediately *after* each OOM failed too,
+in six seconds, with something unrelated:
+
+    Caused by: java.lang.NullPointerException: Cannot invoke
+      "org.apache.spark.SparkEnv.conf()" because the return value of
+      "org.apache.spark.SparkEnv$.get()" is null
+
+**What I assumed:** that I had broken something in `job.py` — the failure moved
+when I changed the order of the configurations, which looked exactly like a
+state bug in my own code.
+
+**What it actually was:** when `day9.py` dies of an OutOfMemoryError, the
+**python process exits and the JVM does not**. It is a child of a dead parent,
+nothing reaps it, and it sits there holding ~4 GB of a 16 GB laptop and port
+4040. The next run starts on a machine with a quarter of its memory already
+gone, binds its UI to 4041, and falls over during session startup. The
+NullPointerException is the *second* casualty and says nothing about the cause.
+
+**How I found out:** `ps aux | grep java` between two runs. There were two
+JVMs, and the older one's application name was a run I had watched fail twenty
+minutes earlier.
+
+**What I'd check first next time:** after any crash in a subprocess that starts
+a JVM, check that the JVM is actually gone before believing anything the next
+run says. More generally: when a failure only happens after another failure,
+the second one is usually not a failure at all, it is debris.
+
+**What changed:** `day14.py` starts each run in its own process group
+(`start_new_session=True`) and SIGKILLs the whole group afterwards, pass or
+fail, then waits for `pgrep -f org.apache.spark.deploy` to come back empty
+before starting the next one. Two of the three configurations in that matrix
+are *expected* to OOM, so this is the normal path, not an edge case.

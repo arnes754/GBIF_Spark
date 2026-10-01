@@ -54,8 +54,9 @@ def main():
     p.add_argument("--max-partition-bytes", type=int,
                    default=job.DEFAULT_MAX_PARTITION_BYTES,
                    help="spark.sql.files.maxPartitionBytes (day 11)")
-    p.add_argument("--cache", default="memory_and_disk", choices=job.CACHE_MODES,
-                   help="how to persist the enriched table (day 13)")
+    p.add_argument("--cache", default="none", choices=job.CACHE_MODES,
+                   help="how to persist the enriched table. Default changed "
+                        "from memory_and_disk to none on day 13 - see WEEK3.md")
     p.add_argument("--join", default="auto", choices=job.JOIN_MODES,
                    help="let Spark choose, force broadcast, or forbid it (day 12)")
     p.add_argument("--no-aqe", action="store_true", help="turn AQE off (day 12)")
