@@ -5,9 +5,9 @@ time, every Exchange with its shuffle bytes, and per-task min/median/max so
 skew can be told apart from slowness. --hold keeps the session alive so the
 UI at :4040 stays reachable after the run.
 
-    uv run python day10.py
-    uv run python day10.py --batches b0004
-    uv run python day10.py --hold
+    uv run python -m week3.day10
+    uv run python -m week3.day10 --batches b0004
+    uv run python -m week3.day10 --hold
 
 Runs with --cache none by default: persisting the fact table OOMs the driver
 on anything above the smallest batch. See day13.py.
@@ -23,7 +23,7 @@ import bench
 import job
 from bench import banner, gb
 
-REPORTS = pathlib.Path(__file__).parent / "data" / "reports"
+REPORTS = pathlib.Path(__file__).resolve().parent.parent / "data" / "reports"
 
 # Minimum share of wall time for a stage to count as a bottleneck.
 BOTTLENECK_SHARE = 0.15

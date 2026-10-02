@@ -6,8 +6,8 @@ PUBLISHER, not the record. Without registry.py's dimension table there is no
 publisher column and no claim to test.
 
     uv run python registry.py fetch && uv run python registry.py build
-    uv run python day7.py
-    SKEW=1 uv run python day7.py      # include the salting experiment
+    uv run python -m week2.day7
+    SKEW=1 uv run python -m week2.day7      # include the salting experiment
 
 The three questions this file answers, in order:
   1. does Spark broadcast the dimension on its own, and how does it decide

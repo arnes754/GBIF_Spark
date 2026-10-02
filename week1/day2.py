@@ -2,8 +2,8 @@
 
 2 GB slice: 74 of the 9,898 shards in the 2026-09-01 snapshot (~266 GB).
 
-Run: uv run python day2.py
-     SLICE_GB=0.2 uv run python day2.py
+Run: uv run python -m week1.day2
+     SLICE_GB=0.2 uv run python -m week1.day2
 """
 import os
 

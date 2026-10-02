@@ -11,8 +11,8 @@ publishers than WITHIN them" is a variance decomposition, and every term in it
 is a window or a grouped aggregate.
 
     uv run python registry.py build      # day 7 built the dimension
-    uv run python day8.py
-    HEAVY=1 uv run python day8.py        # include the unpartitioned-window trap
+    uv run python -m week2.day8
+    HEAVY=1 uv run python -m week2.day8        # include the unpartitioned-window trap
 """
 import os
 

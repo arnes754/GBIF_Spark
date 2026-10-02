@@ -8,10 +8,10 @@ The rule is full data in, small aggregates out. The
 inputs are gigabytes, the outputs are kilobytes, and nothing downstream ever
 reads the fact table again.
 
-    uv run python day9.py --batches b0004 --tag run
-    uv run python day9.py --batches b0004 --cache memory_and_disk \
+    uv run python -m week2.day9 --batches b0004 --tag run
+    uv run python -m week2.day9 --batches b0004 --cache memory_and_disk \
         --no-write-in-place --no-cache-results --tag as-day-9-shipped
-    uv run python day9.py --report          # compare past runs
+    uv run python -m week2.day9 --report          # compare past runs
 
 Every run appends a row to data/reports/runs.jsonl with per-stage wall time,
 bytes read and bytes shuffled, so "did that change help" is a lookup rather
@@ -32,8 +32,8 @@ import time
 import job
 from bench import banner, gb
 
-HERE = pathlib.Path(__file__).parent
-REPORTS = HERE / "data" / "reports"
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+REPORTS = ROOT / "data" / "reports"
 RUNS = REPORTS / "runs.jsonl"
 
 
@@ -47,7 +47,7 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--table", default=job.DEFAULT_TABLE)
     p.add_argument("--dim", default=job.DEFAULT_DIM)
-    p.add_argument("--out", default=str(HERE / "data" / "results"))
+    p.add_argument("--out", default=str(ROOT / "data" / "results"))
     p.add_argument("--batches", default="",
                    help="comma-separated ingest batches, e.g. b0000,b0003. "
                         "Empty = the whole 90 GB table.")
@@ -160,7 +160,7 @@ def main():
     REPORTS.mkdir(parents=True, exist_ok=True)
     with RUNS.open("a") as f:
         f.write(json.dumps(record, default=float) + "\n")
-    print(f"\nappended to {RUNS}   (uv run python day9.py --report)")
+    print(f"\nappended to {RUNS}   (uv run python -m week2.day9 --report)")
 
     spark.stop()
     print("\ndone.")
@@ -175,7 +175,7 @@ def load_runs():
 def print_report():
     runs = load_runs()
     if not runs:
-        return print("no runs yet - try: uv run python day9.py --batches b0000,b0003")
+        return print("no runs yet - try: uv run python -m week2.day9 --batches b0000,b0003")
     banner(f"{len(runs)} runs")
     print(f"  {'tag':<16}{'when':<18}{'rows':>15}{'shuf':>6}{'cache':>16}"
           f"{'wall s':>9}{'read':>11}{'shuffled':>11}  ok")

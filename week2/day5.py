@@ -9,9 +9,9 @@ so it is repeatable and costs no S3. The numbers that matter are ratios -
 bytes read vs bytes on disk, files opened vs files present - and those hold at
 any scale.
 
-    uv run python day5.py
-    WRITE=0 uv run python day5.py      # skip section 5-6 (they write ~GBs)
-    HOLD_FOR_UI=1 uv run python day5.py
+    uv run python -m week2.day5
+    WRITE=0 uv run python -m week2.day5      # skip section 5-6 (they write ~GBs)
+    HOLD_FOR_UI=1 uv run python -m week2.day5
 """
 import os
 import pathlib

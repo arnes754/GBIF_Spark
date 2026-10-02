@@ -8,9 +8,9 @@ starts and every configuration sees the same warm cache.
 
 The configurations are defined in CONFIGS below as day9.py flags.
 
-    uv run python day14.py
-    uv run python day14.py --slices b0003,b0000,b0004 --warm
-    uv run python day14.py --report
+    uv run python -m week3.day14
+    uv run python -m week3.day14 --slices b0003,b0000,b0004 --warm
+    uv run python -m week3.day14 --report
 """
 import argparse
 import json
@@ -26,9 +26,9 @@ import curate
 import job
 from bench import banner, gb
 
-HERE = pathlib.Path(__file__).parent
-RUNS = HERE / "data" / "reports" / "runs.jsonl"
-OUT = HERE / "data" / "scratch" / "day14"
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+RUNS = ROOT / "data" / "reports" / "runs.jsonl"
+OUT = ROOT / "data" / "scratch" / "day14"
 
 # Each value is a list of day9.py flags. Three configurations rather than two
 # so the middle one isolates the cache change from the rest.
@@ -58,12 +58,12 @@ def run_once(slice_name, config_name, timeout_s):
     startup for an unrelated-looking reason.
     """
     tag = f"{config_name}-{slice_name}"
-    cmd = [sys.executable, "-u", str(HERE / "day9.py"),
+    cmd = [sys.executable, "-u", "-m", "week2.day9",
            "--batches", slice_name, "--tag", tag,
            "--out", str(OUT / tag)] + CONFIGS[config_name]
     before = RUNS.stat().st_size if RUNS.exists() else 0
     t0 = time.perf_counter()
-    proc = subprocess.Popen(cmd, cwd=HERE, stdout=subprocess.PIPE,
+    proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True,
                             start_new_session=True)
     try:
@@ -224,7 +224,7 @@ def main():
                    help="re-print from a previous day14 result file")
     args = p.parse_args()
 
-    result_file = HERE / "data" / "reports" / "day14_before_after.json"
+    result_file = ROOT / "data" / "reports" / "day14_before_after.json"
     if args.report:
         if not result_file.exists():
             return print("no day14 results yet")
@@ -245,7 +245,7 @@ def main():
     if args.warm:
         print("\n  warming the page cache...")
         for s in slices:
-            for f in (HERE / "data" / "curated" / "occurrence_slim"
+            for f in (ROOT / "data" / "curated" / "occurrence_slim"
                       / f"ingest_batch={s}").rglob("*.parquet"):
                 f.read_bytes()
         print("  warm.")

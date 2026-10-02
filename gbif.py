@@ -182,7 +182,7 @@ def spark_session(app="gbif", driver_memory="4g", shuffle_partitions=24,
     """Build the session. SPARK_CORES and SPARK_MEM override cores and heap
     from the environment, so a busy machine does not need a code change:
 
-        SPARK_CORES=4 SPARK_MEM=3g uv run python day5.py
+        SPARK_CORES=4 SPARK_MEM=3g uv run python -m week2.day5
     """
     from pyspark.sql import SparkSession
 

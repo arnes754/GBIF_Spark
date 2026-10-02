@@ -1,7 +1,7 @@
 """Day 3 - first transformations: select / filter / withColumn / groupBy / agg.
 
-Run: uv run python day3.py
-     SLICE_GB=0.2 uv run python day3.py
+Run: uv run python -m week1.day3
+     SLICE_GB=0.2 uv run python -m week1.day3
 """
 import os
 import time

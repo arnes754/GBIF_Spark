@@ -15,9 +15,9 @@ MEMORY_AND_DISK spills those to local disk instead. DISK_ONLY always writes to
 disk. Building the cache is not free either: each task unrolls its partition
 into the columnar format in the same heap the query is using.
 
-    uv run python day13.py
-    uv run python day13.py --batches b0003 --big b0000
-    uv run python day13.py --only 2
+    uv run python -m week3.day13
+    uv run python -m week3.day13 --batches b0003 --big b0000
+    uv run python -m week3.day13 --only 2
 
   1  how many times the job reads the enriched table
   2  no cache vs the three storage levels, end to end

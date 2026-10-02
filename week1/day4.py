@@ -4,9 +4,9 @@ Same 2 GB slice as days 2-3. explain() reads no data, so those plans are the
 same ones the full 266 GB would give; only timings change. Sections marked SCAN
 actually execute - they stay cheap by asking for one or two columns only.
 
-Run: uv run python day4.py
-     FULL=1 uv run python day4.py          # all 9,898 shards
-     HOLD_FOR_UI=1 uv run python day4.py   # keep session alive for :4040
+Run: uv run python -m week1.day4
+     FULL=1 uv run python -m week1.day4          # all 9,898 shards
+     HOLD_FOR_UI=1 uv run python -m week1.day4   # keep session alive for :4040
 """
 import os
 import time

@@ -16,8 +16,8 @@ another row, and if so, does that row live on another machine.
 The shuffle is the unit of cost in Spark. Everything in this file is a way of
 either avoiding one, making one smaller, or proving one happened.
 
-    uv run python day6.py
-    SLOW=1 uv run python day6.py     # include the deliberately-awful section 6
+    uv run python -m week2.day6
+    SLOW=1 uv run python -m week2.day6     # include the deliberately-awful section 6
 """
 import os
 import time

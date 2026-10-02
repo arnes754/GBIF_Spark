@@ -11,9 +11,9 @@ Three different things called partitioning:
 partitionBy() at write time is a fourth thing: it makes directories, and only
 pays off if later queries filter on that column.
 
-    uv run python day11.py
-    uv run python day11.py --batches b0000,b0003
-    uv run python day11.py --only 3
+    uv run python -m week3.day11
+    uv run python -m week3.day11 --batches b0000,b0003
+    uv run python -m week3.day11 --only 3
 
   1  input partitioning: maxPartitionBytes, task count, file sizes
   2  partition pruning: which filters reach the directory listing
@@ -32,7 +32,7 @@ import curate
 import job
 from bench import banner, gb, measure
 
-SCRATCH = pathlib.Path(__file__).parent / "data" / "scratch" / "day11"
+SCRATCH = pathlib.Path(__file__).resolve().parent.parent / "data" / "scratch" / "day11"
 
 # Common rule of thumb for shuffle partition size, used as the target in
 # experiment 3.

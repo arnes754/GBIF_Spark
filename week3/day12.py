@@ -10,9 +10,9 @@ Skew is the other half: a shuffle assigns keys to partitions by hash, so one
 very common key puts a disproportionate share of the rows in one task. Totals
 stay correct and the job runs as slow as its slowest task.
 
-    uv run python day12.py
-    uv run python day12.py --batches b0000,b0003
-    uv run python day12.py --only 3
+    uv run python -m week3.day12
+    uv run python -m week3.day12 --batches b0000,b0003
+    uv run python -m week3.day12 --only 3
 
   1  does Spark broadcast the dimension on its own
   2  broadcast vs sort-merge on the job's actual join
