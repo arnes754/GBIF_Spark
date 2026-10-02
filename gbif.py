@@ -197,6 +197,11 @@ def spark_session(app="gbif", driver_memory="4g", shuffle_partitions=24,
         # ~4 MB/s link ceiling more readers just means more timeouts.
         .master(f"local[{cores},{max_task_failures}]")
         .config("spark.driver.memory", driver_memory)
+        # Keep the driver's own connections on loopback. By default it binds
+        # to the LAN address, and anything else answering on that port kills
+        # startup with "Too large frame".
+        .config("spark.driver.host", "127.0.0.1")
+        .config("spark.driver.bindAddress", "127.0.0.1")
         .config(
             "spark.jars.packages",
             f"org.apache.hadoop:hadoop-aws:{_hadoop_version()},"
