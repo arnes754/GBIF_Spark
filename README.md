@@ -7,6 +7,7 @@ mapping, broken down by country, decade and publisher. Runs on `local[*]`.
 
 ## Requirements
 
+- macOS or Linux. On Windows, use WSL
 - Python 3.13
 - Java 17 or 21 (`gbif.py` finds it; set `JAVA_HOME` to override)
 - [uv](https://docs.astral.sh/uv/)
@@ -20,7 +21,7 @@ sudo apt install openjdk-17-jdk             # Debian/Ubuntu, then install uv
 ## Setup
 
 ```bash
-git clone <repo-url> && cd DataMonth3
+git clone https://github.com/arnes754/GBIF_Spark.git && cd GBIF_Spark
 uv sync
 uv run python -c "import gbif; print(gbif.find_java_home())"   # checks Java
 ```
@@ -55,7 +56,7 @@ Prints wall time, bytes read and shuffle per stage. Results go to
 
 ## Tests
 
-No S3 needed, about 20 seconds each.
+No S3 needed, under a minute each.
 
 ```bash
 uv run python test_curate.py
@@ -97,3 +98,13 @@ Measured on 1 GB and 5.7 GB slices (`week3/`).
   tasks, so the shuffle and input partition settings were left unchanged.
 - Skew: one `datasetkey` has 48% of rows, but the join is a broadcast, so there
   is no shuffle to skew.
+
+## Change of plan
+
+Week 3 was meant to run the job on the full 266 GB on a standalone Spark
+cluster. It became an optimisation week instead, because with the fact table
+cached the job ran the driver out of memory at 1 GB, so moving it to a cluster
+of smaller workers would not have measured anything useful.
+
+Still to do: `spark-submit` to a cluster, and a run over the full snapshot.
+The largest ingest so far is 5,929 of 9,898 shards (159 GB).
