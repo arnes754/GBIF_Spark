@@ -1,21 +1,18 @@
 # GBIF occurrence pipeline
 
-PySpark job over the GBIF occurrence snapshot `2026-09-01`
-(`s3://gbif-open-data-eu-central-1`, 9,898 parquet shards, about 266 GB).
-It measures how much of GBIF is usable for 1-degree species distribution
-mapping, broken down by country, decade and publisher. Runs on `local[*]`.
+PySpark pipeline over the GBIF occurrence snapshot `2026-09-01`: how much of
+GBIF is usable for 1-degree species distribution mapping, by country, decade
+and publisher.
 
 ## Requirements
 
-- macOS or Linux. On Windows, use WSL
-- Python 3.13
-- Java 17 or 21 (`gbif.py` finds it; set `JAVA_HOME` to override)
-- [uv](https://docs.astral.sh/uv/)
+- macOS or Linux (on Windows, use WSL)
+- Python 3.13, Java 17 or 21, [uv](https://docs.astral.sh/uv/)
 - About 2 GB of free disk and an internet connection
 
 ```bash
-brew install openjdk@17 uv                  # macOS
-sudo apt install openjdk-17-jdk             # Debian/Ubuntu, then install uv
+brew install openjdk@17 uv          # macOS
+sudo apt install openjdk-17-jdk     # Debian/Ubuntu, then install uv
 ```
 
 ## Setup
@@ -23,88 +20,48 @@ sudo apt install openjdk-17-jdk             # Debian/Ubuntu, then install uv
 ```bash
 git clone https://github.com/arnes754/GBIF_Spark.git && cd GBIF_Spark
 uv sync
-uv run python -c "import gbif; print(gbif.find_java_home())"   # checks Java
+```
+
+Run everything below from the repo root.
+
+## Run everything
+
+```bash
+uv run python -m gbif_spark all       # build the data, run the job, print the answer
+uv run python -m gbif_spark status    # what is built, and past runs
 ```
 
 ## Build the data
 
-`data/` is not in git. The first step downloads from S3 (no credentials) and
-takes about ten minutes for 2 GB.
-
 ```bash
-uv run python curate.py build --gb 2        # fact table, appends a new batch
-uv run python registry.py keys              # publisher dimension from the GBIF API
-uv run python registry.py fetch
-uv run python registry.py build
-uv run python curate.py status              # check what was built
+uv run python -m gbif_spark data
 ```
 
-## Run
+Or one step at a time:
 
 ```bash
-uv run python -m week2.day9                     # whole table
-uv run python -m week2.day9 --batches b0000     # one ingest batch
-uv run python -m week2.day9 --report            # compare previous runs
+uv run python -m gbif_spark curate build --gb 2
+uv run python -m gbif_spark registry keys
+uv run python -m gbif_spark registry fetch
+uv run python -m gbif_spark registry build
 ```
 
-Run everything from the repo root. The scripts in `week*/` import the modules
-at the top level, so they are run with `-m`.
+## Run the job
 
-Prints wall time, bytes read and shuffle per stage. Results go to
-`data/results/`, and each run is logged to `data/reports/runs.jsonl`.
-`uv run python -m week2.day9 --help` lists the tuning flags.
+```bash
+uv run python -m gbif_spark job                    # whole table
+uv run python -m gbif_spark job --batches b0000    # one ingest batch
+uv run python -m gbif_spark job --report           # compare runs
+```
 
 ## Tests
 
-No S3 needed, under a minute each.
+```bash
+uv run python -m gbif_spark test
+```
+
+## Day-by-day experiments
 
 ```bash
-uv run python test_curate.py
-uv run python test_bench.py
+uv run python -m gbif_spark day 5     # any day from 1 to 14
 ```
-
-## Layout
-
-```
-gbif.py        Java lookup, S3 shard listing, Spark session
-curate.py      builds the curated fact table from the snapshot
-registry.py    builds the publisher dimension from the GBIF API
-job.py         the pipeline (nine stages) and its Config
-bench.py       metrics from the Spark UI REST API
-run_ingest.sh  runs curate.py build in chunks, for bigger tables
-
-week1/         day1-day4: exploration, transformations, plans and partitions
-week2/         day5-day9: reads and writes, shuffles, joins, aggregations;
-               day9.py is the command line for job.py
-week3/         day10-day14: Spark UI, partitioning, broadcast and skew,
-               caching, before and after
-```
-
-Each `dayN.py` is a standalone experiment. Days are numbered straight through
-the three weeks, so `week2/day5.py` is week 2, day 1.
-
-## Optimisation decisions
-
-Measured on 1 GB and 5.7 GB slices (`week3/`).
-
-- Caching: the fact table is not cached. It is a cheap scan plus a broadcast
-  join, and caching it ran the driver out of memory above about 20 MB. Only the
-  small per-dataset aggregate is cached.
-- Writes: each aggregate is written by the stage that computes it, instead of
-  being computed twice. 296s to 243s and 125 GB to 74 GB read on 5.7 GB.
-- Joins: the dimension is 0.2 MB, so Spark broadcasts it without a hint. Left
-  as is.
-- Partitioning: shuffles are kilobytes and the input already packs into 15
-  tasks, so the shuffle and input partition settings were left unchanged.
-- Skew: one `datasetkey` has 48% of rows, but the join is a broadcast, so there
-  is no shuffle to skew.
-
-## Change of plan
-
-Week 3 was meant to run the job on the full 266 GB on a standalone Spark
-cluster. It became an optimisation week instead, because with the fact table
-cached the job ran the driver out of memory at 1 GB, so moving it to a cluster
-of smaller workers would not have measured anything useful.
-
-Still to do: `spark-submit` to a cluster, and a run over the full snapshot.
-The largest ingest so far is 5,929 of 9,898 shards (159 GB).

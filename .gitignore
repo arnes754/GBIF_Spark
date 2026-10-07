@@ -9,11 +9,6 @@ wheels/
 # Virtual environments
 .venv
 
-# cached S3 shard listing (regenerated on demand)
-.shard_cache.json
-
-# materialised parquet + ingest manifests (rebuild with curate.py)
-data/
-
-# run logs
-logs/
+# pipeline output (uv run python -m gbif_spark data rebuilds it)
+gbif_spark/data/*
+!gbif_spark/data/.gitkeep
